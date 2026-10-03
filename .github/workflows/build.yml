@@ -1,0 +1,60 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential autoconf automake libtool perl git wget unzip ca-certificates
+          dkp-pacman -Sy --needed --noconfirm 3ds-dev 3ds-curl 3ds-mbedtls 3ds-jansson 3ds-libopus 3ds-zlib
+
+      - name: Fetch third-party sources
+        run: bash tools/fetch-deps.sh
+
+      - name: Cache OpenSSL and libexpat
+        id: portlibs
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/devkitpro/portlibs/3ds/lib/libssl.a
+            /opt/devkitpro/portlibs/3ds/lib/libcrypto.a
+            /opt/devkitpro/portlibs/3ds/lib/libexpat.a
+            /opt/devkitpro/portlibs/3ds/include/openssl
+            /opt/devkitpro/portlibs/3ds/include/crypto
+            /opt/devkitpro/portlibs/3ds/include/expat.h
+            /opt/devkitpro/portlibs/3ds/include/expat_config.h
+            /opt/devkitpro/portlibs/3ds/include/expat_external.h
+          key: portlibs-${{ hashFiles('tools/fetch-deps.sh', 'tools/build-deps.sh') }}
+
+      - name: Build OpenSSL and libexpat
+        if: steps.portlibs.outputs.cache-hit != 'true'
+        run: bash tools/build-deps.sh
+
+      - name: Build Oboro.3dsx
+        run: make
+
+      - name: Build Oboro.cia
+        run: |
+          wget -q https://github.com/Epicpkmn11/bannertool/releases/download/v1.2.2/bannertool.zip
+          unzip -q bannertool.zip -d bannertool
+          wget -q https://github.com/3DSGuy/Project_CTR/releases/download/makerom-v0.18.3/makerom-v0.18.3-ubuntu_x86_64.zip
+          unzip -q makerom-v0.18.3-ubuntu_x86_64.zip -d makerom
+          chmod +x bannertool/linux-x86_64/bannertool makerom/makerom
+          make cia BANNERTOOL="$PWD/bannertool/linux-x86_64/bannertool" MAKEROM="$PWD/makerom/makerom"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Oboro
+          path: |
+            Oboro.3dsx
+            Oboro.cia

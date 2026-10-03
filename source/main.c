@@ -1,0 +1,2041 @@
+#include <3ds.h>
+
+#include <malloc.h>
+#include <poll.h>
+#include <stdarg.h>
+#include <jansson.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#include "app.h"
+#include "app_paths.h"
+#include "audio_output.h"
+#include "diagnostic.h"
+#include "game_art.h"
+#include "game_prefs.h"
+#include "queue_alert.h"
+#include "report.h"
+#include "perf_stats.h"
+#include "updater.h"
+#include "play_history.h"
+#include "screenshot.h"
+#include "zoom_zones.h"
+#include "host_client.h"
+#include "host_input.h"
+#include "launch_stats.h"
+#include "net_memory.h"
+#include "http_client.h"
+#include "mvd_video.h"
+#include "net_worker.h"
+#include "remote_keyboard.h"
+#include "settings.h"
+#include "stream_profile.h"
+#include "ui.h"
+#include "moon_transport.h"
+
+#define SOC_BUFFER_SIZE (0x100000)
+#define SOC_BUFFER_ALIGNMENT (0x1000)
+#define MENU_COMBO_HOLD_MS 800
+
+static u32 *g_soc_buffer;
+static bool g_soc_ready;
+static bool g_ac_ready;
+static bool g_ptm_ready;
+static bool g_mcu_ready;
+/* ndm:u: exclusive Wi-Fi while a game runs (see wifi_exclusive). */
+static bool g_ndm_ready, g_ndm_exclusive;
+/* Keep the bounded token/catalog state out of the small 3DSX main stack. */
+HostClient g_client;
+static MoonTransport g_transport;
+static App g_app;
+static HostGame g_current_game;
+static SwkbdState g_search_keyboard;
+static bool g_quit;
+static const char *g_busy_message;
+static bool g_leave_pending;
+static bool g_screenshot_requested;
+static void show_notice(const char *text);
+static void apply_game_options(const GamePrefs *prefs);
+static void launch_with_options(const HostGame *base, unsigned variant);
+/* Main-loop health while streaming: the longest iteration and how many took
+ * over 25 ms (a stalled loop delays packets, input and presents alike). */
+static unsigned g_loop_max_ms, g_loop_slow;
+static char g_notice[96];
+static u64 g_notice_until;
+
+/* Pointer-mode state: A holds the mouse button, taps on the pad click. */
+static bool g_mouse_a_held;
+static u64 g_mouse_a_min_release_at;
+static bool g_mouse_tap_held;
+static u64 g_mouse_tap_release_at;
+static bool g_touchpad_active;
+static unsigned g_touchpad_start_x, g_touchpad_start_y;
+static unsigned g_touchpad_last_x, g_touchpad_last_y;
+static u64 g_touchpad_started_at;
+static unsigned g_touchpad_travel;
+static u64 g_combo_started_at;
+
+/* ---- Services ------------------------------------------------------------ */
+
+static void shutdown_services(void)
+{
+    moon_close(&g_transport);
+    diagnostic_log("APP", REPORT_CLEAN_EXIT);
+    diagnostic_close();
+    http_global_exit();
+    if (g_soc_ready) socExit();
+    free(g_soc_buffer);
+    if (g_ptm_ready) ptmuExit();
+    if (g_mcu_ready) mcuHwcExit();
+    if (g_ndm_exclusive) {
+        NDMU_UnlockState();
+        NDMU_LeaveExclusiveState();
+        g_ndm_exclusive = false;
+    }
+    if (g_ndm_ready) ndmuExit();
+    if (g_ac_ready) acExit();
+}
+
+static bool init_services(char *error, size_t error_size)
+{
+    Result result = acInit();
+    if (R_SUCCEEDED(result)) g_ac_ready = true;
+    else {
+        snprintf(error, error_size, "ac:u init 0x%08lX", (unsigned long)result);
+        return false;
+    }
+    g_ptm_ready = R_SUCCEEDED(ptmuInit());
+    /* Battery percentage for the stats tiles; the bars still work without it. */
+    g_mcu_ready = R_SUCCEEDED(mcuHwcInit());
+    g_ndm_ready = R_SUCCEEDED(ndmuInit());
+    g_soc_buffer = memalign(SOC_BUFFER_ALIGNMENT, SOC_BUFFER_SIZE);
+    if (!g_soc_buffer) {
+        snprintf(error, error_size, "1 MiB SOC buffer allocation failed");
+        return false;
+    }
+    result = socInit(g_soc_buffer, SOC_BUFFER_SIZE);
+    if (R_FAILED(result)) {
+        snprintf(error, error_size, "soc:u init 0x%08lX", (unsigned long)result);
+        return false;
+    }
+    g_soc_ready = true;
+    if (!http_global_init()) {
+        snprintf(error, error_size, "libcurl global init failed");
+        return false;
+    }
+    return true;
+}
+
+/* ---- Rendering ----------------------------------------------------------- */
+
+static void present_video(void)
+{
+    static unsigned last_frame;
+    const unsigned frame = mvd_video_decoded_frames();
+    if (frame == last_frame) return;
+    last_frame = frame;
+    /* MVD frames are copied into the single-buffered top framebuffer by the
+     * CPU; flush them to memory and re-present that buffer. */
+    u16 width = 0, height = 0;
+    u8 *framebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &width, &height);
+    if (framebuffer) GSPGPU_FlushDataCache(framebuffer, (u32)width * height * 2);
+    gfxScreenSwapBuffers(GFX_TOP, false);
+}
+
+/* Frame pacing for wide video. The top LCD refreshes at ~60 Hz and the
+ * stream is 30 fps, so a frame is shown for exactly two vblanks. Frames are
+ * shown in decode order; up to two wait in reserve to absorb network jitter,
+ * a late frame repeats the previous one, and beyond two queued the oldest is
+ * skipped so latency cannot grow. Presentation is double-buffered, so each
+ * frame appears whole at a vblank (no tearing). */
+static void render_wide_video(bool draw_bottom)
+{
+    static u32 last_seen_vblank, last_present_vblank;
+    static u64 present_ticks, present_max;
+    static unsigned presented, repeated, skipped, drained, last_log_frames;
+    static unsigned backlog_streak, depth_sum;
+    /* Spare frames kept against late arrivals. Build 64 logged ~2 frames a
+     * second arriving 50-140 ms after the previous one (Wi-Fi bunching),
+     * which one spare (33 ms) cannot cover. Two repeats within 20 s raise
+     * the reserve to two spares (+33 ms delay); a calm minute lowers it. */
+    static unsigned reserve = 1;
+    static u64 last_repeat_at;
+    /* Surplus frames (the 30.00 vs 29.92 fps drift) are not dropped the
+     * moment they are confirmed: the pacer waits up to ~3 s for a frame
+     * whose encoded size says little moved, and drops that one instead. */
+    static unsigned drop_wait, quiet_drops;
+    static float avg_bytes;
+    bool present = false;
+    /* citro3d counts top-screen vblanks in its own GSP handler (only one
+     * handler per event is allowed, so we must not register another). */
+    const u32 vblank = C3D_FrameCounter(0);
+    if (vblank != last_seen_vblank) {
+        const u32 since = vblank - last_present_vblank;
+        last_seen_vblank = vblank;
+        const u64 now_ms = osGetTime();
+        /* Weak / hotspot keeps one more spare frame (+33 ms) against the
+         * longer, burstier gaps of mobile data. */
+        const unsigned reserve_low = stream_profile_weak() ? 2 : 1;
+        if (reserve < reserve_low) reserve = reserve_low;
+        if (reserve > reserve_low && now_ms - last_repeat_at >= 60000) reserve = reserve_low;
+        /* The decoder can be rebuilt from core 2 (a new stream size):
+         * frames are only looked at under the transport lock. */
+        moon_lock();
+        unsigned ready = mvd_video_ready_frames();
+        while (ready > reserve + 3) {
+            mvd_video_skip_oldest_frame();
+            --ready;
+            ++skipped;
+            ++g_perf.skipped;
+        }
+        /* Strict two-vblank cadence: a frame is never shown for only one
+         * refresh (that reads as a hitch too); overflow is trimmed above. */
+        if (ready && since >= 2) {
+            present = true;
+        } else if (!ready && since == 2) {
+            ++repeated;
+            ++g_perf.repeated;
+            if (last_repeat_at && now_ms - last_repeat_at < 20000) reserve = reserve_low + 1;
+            last_repeat_at = now_ms;
+        }
+        /* The spare frames must stay. The PC sends 30.00 fps but the 3DS
+         * LCD shows 29.92, so one surplus frame builds up every ~12 s and a
+         * late frame leaves one behind too. Only a frame beyond the reserve
+         * that has sat for a whole second is dropped (build 62 dropped the
+         * reserve itself every ~4 s and was choppy). */
+        if (present) {
+            depth_sum += ready;
+            const float bytes = (float)mvd_video_ready_frame_bytes(0);
+            avg_bytes = avg_bytes > 0.0f ? avg_bytes * 0.95f + bytes * 0.05f : bytes;
+            backlog_streak = ready >= reserve + 2 ? backlog_streak + 1 : 0;
+            if (backlog_streak >= 30 || drop_wait) {
+                /* Candidates exclude the frame about to be shown. */
+                unsigned best = 0;
+                size_t best_bytes = (size_t)-1;
+                for (unsigned i = 1; i < ready; ++i) {
+                    const size_t b = mvd_video_ready_frame_bytes(i);
+                    if (b && b < best_bytes) { best_bytes = b; best = i; }
+                }
+                ++drop_wait;
+                /* The bar relaxes as the wait goes on (0.7 -> 1.0 of the
+                 * average), so the drop still lands on a low-motion frame:
+                 * at ~1.6 Mbps only 2 of 21 drops found a frame under 0.7
+                 * and the rest were forced after 5 s (beta.25 test). */
+                const float bar = 0.7f + 0.3f * (float)(drop_wait < 150 ? drop_wait : 150) / 150.0f;
+                const bool quiet = best && (float)best_bytes <= avg_bytes * bar;
+                if (ready < reserve + 2) {
+                    drop_wait = 0; /* the surplus went away on its own */
+                } else if (best && (quiet || drop_wait >= 150)) {
+                    mvd_video_skip_ready_frame(best);
+                    if (quiet) ++quiet_drops;
+                    ++drained;
+                    ++g_perf.drained;
+                    drop_wait = 0;
+                }
+                backlog_streak = 0;
+            }
+        }
+        moon_unlock();
+    }
+    if (!present && !draw_bottom) return;
+    const u64 start = svcGetSystemTick();
+    moon_lock();
+    const void *frame = present ? mvd_video_take_gpu_frame() : NULL;
+    if (frame && g_screenshot_requested) {
+        g_screenshot_requested = false;
+        show_notice(screenshot_capture(frame) ? "Saving screenshot..." : "Screenshot failed");
+    }
+    if (frame) {
+        ui_video_upload(frame);
+        mvd_video_release_gpu_frame();
+    }
+    moon_unlock();
+    ui_frame_begin(false);
+    if (frame) {
+        ui_begin_top_video();
+        ui_draw_video();
+    }
+    if (draw_bottom) {
+        ui_begin_bottom();
+        screens_draw_bottom(&g_app);
+    }
+    ui_frame_end();
+    if (!frame) return;
+    last_present_vblank = vblank;
+    const u64 ticks = svcGetSystemTick() - start;
+    present_ticks += ticks;
+    if (ticks > present_max) present_max = ticks;
+    if (++presented - last_log_frames >= 120) {
+        const u64 per_us = SYSCLOCK_ARM11 / 1000000u;
+        const unsigned frames = presented - last_log_frames;
+        diagnostic_log("VIDEO", "paced present frames=%u avg/max=%llu/%llu us repeated=%u skipped=%u drained=%u quiet=%u depth=%u.%02u reserve=%u loopMax=%u slow=%u",
+                       frames,
+                       (unsigned long long)(present_ticks / frames / per_us),
+                       (unsigned long long)(present_max / per_us), repeated, skipped, drained,
+                       quiet_drops, depth_sum / frames, depth_sum * 100 / frames % 100, reserve,
+                       g_loop_max_ms, g_loop_slow);
+        g_loop_max_ms = g_loop_slow = 0;
+        present_ticks = present_max = 0;
+        repeated = skipped = drained = quiet_drops = depth_sum = 0;
+        last_log_frames = presented;
+    }
+}
+
+static void render(bool draw_bottom)
+{
+    const bool video = g_app.view == VIEW_STREAM;
+    if (video && mvd_video_wide()) {
+        render_wide_video(draw_bottom);
+        return;
+    }
+    if (video && !draw_bottom) {
+        present_video();
+        return;
+    }
+    /* Menus sync to vblank; the stream never waits for it, so video and
+     * input keep flowing while the lower screen redraws. */
+    ui_frame_begin(!video);
+    if (!video) {
+        ui_begin_top();
+        screens_draw_top(&g_app);
+    }
+    ui_begin_bottom();
+    screens_draw_bottom(&g_app);
+    ui_frame_end();
+    if (video) present_video();
+}
+
+static void show_notice(const char *text)
+{
+    snprintf(g_notice, sizeof(g_notice), "%s", text);
+    g_notice_until = osGetTime() + 4000;
+}
+
+/* A job asked for while the worker ran background work (stats upload,
+ * update check): it runs as soon as the worker is free. Beta.19 test: the
+ * player had to press A two or three times after a game ("Still working on
+ * the last request") while the session summary was being sent. */
+static struct {
+    bool set;
+    NetJobKind kind;
+    const char *busy;
+    char text[80];
+    HostGame game;
+    bool has_game;
+} g_deferred;
+
+static bool background_job(NetJobKind kind)
+{
+    return kind == NET_JOB_SEND_STATS || kind == NET_JOB_UPDATE_CHECK;
+}
+
+/* Hand a blocking call to the network worker; the UI keeps animating. */
+static bool submit_job(NetJobKind kind, const char *busy, const char *text, const HostGame *game)
+{
+    if (!net_worker_submit(kind, text, game)) {
+        const NetJobKind running = net_worker_current_job();
+        if (background_job(running) && !background_job(kind) && !g_deferred.set) {
+            g_deferred.set = true;
+            g_deferred.kind = kind;
+            g_deferred.busy = busy;
+            snprintf(g_deferred.text, sizeof(g_deferred.text), "%s", text ? text : "");
+            g_deferred.has_game = game != NULL;
+            if (game) g_deferred.game = *game;
+            /* The stats upload retries later; an update check is quick. */
+            if (running == NET_JOB_SEND_STATS) net_worker_cancel();
+            g_busy_message = busy;
+            return true;
+        }
+        show_notice("Still working on the last request");
+        return false;
+    }
+    g_busy_message = busy;
+    return true;
+}
+
+static void run_deferred_job(void)
+{
+    if (!g_deferred.set || net_worker_busy()) return;
+    g_deferred.set = false;
+    if (net_worker_submit(g_deferred.kind, g_deferred.text, g_deferred.has_game ? &g_deferred.game : NULL))
+        g_busy_message = g_deferred.busy;
+}
+
+static void open_modal(AppModal modal, const char *jp, const char *title, const char *text)
+{
+    g_app.modal = modal;
+    snprintf(g_app.modal_jp, sizeof(g_app.modal_jp), "%s", jp);
+    snprintf(g_app.modal_title, sizeof(g_app.modal_title), "%s", title);
+    snprintf(g_app.modal_text, sizeof(g_app.modal_text), "%s", text);
+}
+
+/* ---- View model ---------------------------------------------------------- */
+
+static AppView derive_view(void)
+{
+    if (moon_gameplay_ready(&g_transport) && mvd_video_active() &&
+        mvd_video_decoded_frames() > g_app.stream_frame_base)
+        return VIEW_STREAM;
+    if (host_session_active(&g_client) || g_transport.active)
+        return VIEW_SESSION;
+    if (g_client.auth_state == HOST_AUTH_WAITING) return VIEW_LOGIN;
+    if (g_app.settings_open) return VIEW_SETTINGS;
+    if (!host_has_session(&g_client)) return VIEW_WELCOME;
+    if (g_app.details_open && g_app.selected < g_app.list_count) return VIEW_DETAILS;
+    return VIEW_LIBRARY;
+}
+
+static void refresh_device_status(void)
+{
+    static u64 last;
+    const u64 now = osGetTime();
+    if (last && now - last < 1000) return;
+    last = now;
+    g_app.wifi_bars = osGetWifiStrength();
+    u8 level = 5, charging = 0;
+    if (g_ptm_ready) {
+        PTMU_GetBatteryLevel(&level);
+        PTMU_GetBatteryChargeState(&charging);
+    }
+    g_app.battery_level = level;
+    g_app.charging = charging != 0;
+    u8 percent = 0;
+    g_app.battery_percent = g_mcu_ready && R_SUCCEEDED(MCUHWC_GetBatteryLevel(&percent)) ? (int)percent : -1;
+
+    static unsigned last_frames;
+    const unsigned frames = mvd_video_decoded_frames();
+    g_app.fps = frames >= last_frames ? frames - last_frames : 0;
+    last_frames = frames;
+
+    static unsigned last_resent;
+    const unsigned resent = moon_recovered_packets(&g_transport);
+    g_app.resent_per_second = resent >= last_resent ? resent - last_resent : 0;
+    last_resent = resent;
+    if (g_app.view == VIEW_STREAM && g_perf.active)
+        perf_sample(g_transport.rtt_ms, g_app.wifi_bars, g_transport.video_kbps, g_app.fps,
+                    g_app.resent_per_second, mvd_video_frames_lost(), g_transport.keyframe_requests,
+                    audio_output_concealed());
+}
+
+static void keep_selection_visible(void)
+{
+    if (g_app.selected >= g_app.list_count)
+        g_app.selected = g_app.list_count ? g_app.list_count - 1 : 0;
+    if (g_app.selected < g_app.list_top) g_app.list_top = g_app.selected;
+    if (g_app.selected >= g_app.list_top + LIBRARY_ROWS)
+        g_app.list_top = g_app.selected - LIBRARY_ROWS + 1;
+}
+
+/* ---- Actions ------------------------------------------------------------- */
+
+/* The PC's address, typed on the system keypad. */
+static bool ask_address(char *out, size_t size)
+{
+    swkbdInit(&g_search_keyboard, SWKBD_TYPE_NUMPAD, 2, 15);
+    swkbdSetNumpadKeys(&g_search_keyboard, L'.', 0);
+    swkbdSetHintText(&g_search_keyboard, "Your PC's IP address, like 192.168.1.20");
+    swkbdSetButton(&g_search_keyboard, SWKBD_BUTTON_LEFT, "Cancel", false);
+    swkbdSetButton(&g_search_keyboard, SWKBD_BUTTON_RIGHT, "Connect", true);
+    swkbdSetValidation(&g_search_keyboard, SWKBD_NOTEMPTY_NOTBLANK, 0, 0);
+    if (g_client.address[0]) swkbdSetInitialText(&g_search_keyboard, g_client.address);
+    return swkbdInputText(&g_search_keyboard, out, size) == SWKBD_BUTTON_RIGHT;
+}
+
+/* Reach the PC and pair with it. `ask`: type its address first (otherwise
+ * the one already known is used, for a fresh PIN). */
+static void begin_login(bool ask)
+{
+    char address[64];
+    snprintf(address, sizeof(address), "%s", g_client.address);
+    if ((ask || !address[0]) && !ask_address(address, sizeof(address))) return;
+    /* A pairing request still waiting for its PIN is dropped first. */
+    net_worker_cancel();
+    submit_job(NET_JOB_BEGIN_LOGIN, "Looking for your PC (the first time takes a moment)...", address, NULL);
+}
+
+static void load_library(void)
+{
+    g_app.search_text[0] = '\0';
+    submit_job(NET_JOB_LOAD_LIBRARY, g_client.library_saved_at
+               ? "Refreshing your apps..." : "Loading the apps on your PC...", NULL, NULL);
+}
+
+/* Filter the app list by title; an empty search shows everything. */
+static void search_library(void)
+{
+    char text[sizeof(g_app.search_text)];
+    snprintf(text, sizeof(text), "%s", g_app.search_text);
+    swkbdInit(&g_search_keyboard, SWKBD_TYPE_QWERTY, 2, 64);
+    swkbdSetHintText(&g_search_keyboard, "Search your apps");
+    swkbdSetButton(&g_search_keyboard, SWKBD_BUTTON_LEFT, "Cancel", false);
+    swkbdSetButton(&g_search_keyboard, SWKBD_BUTTON_RIGHT, "Search", true);
+    swkbdSetFeatures(&g_search_keyboard, SWKBD_DARKEN_TOP_SCREEN);
+    if (text[0]) swkbdSetInitialText(&g_search_keyboard, text);
+    if (swkbdInputText(&g_search_keyboard, text, sizeof(text)) != SWKBD_BUTTON_RIGHT) return;
+    snprintf(g_app.search_text, sizeof(g_app.search_text), "%s", text);
+    g_app.selected = g_app.list_top = 0;
+}
+
+static bool title_matches(const char *title, const char *text)
+{
+    const size_t n = strlen(text);
+    for (; *title; ++title)
+        if (!strncasecmp(title, text, n)) return true;
+    return !n;
+}
+
+
+/* Everything a new session of this game needs, before any request. */
+static void prepare_game_session(const HostGame *game)
+{
+    if (game != &g_current_game) g_current_game = *game;
+    snprintf(g_app.game_title, sizeof(g_app.game_title), "%s", g_current_game.title);
+    snprintf(g_app.game_store, sizeof(g_app.game_store), "%s", g_current_game.store);
+    g_app.stream_started_at = 0;
+    g_app.zone_index = -1;
+    g_app.sound_muted = false;
+    zoom_zones_select(g_current_game.app_id);
+    g_app.reconnect_attempt = 0;
+    g_app.controls_open = false;
+    g_app.stream_frame_base = mvd_video_decoded_frames();
+    settings_apply_picture(&g_app.settings);
+    g_app.auto_weak = false;
+    g_app.setup_retries = 0;
+    if (!g_app.settings.net_weak && net_memory_choppy_here()) {
+        stream_profile_set_weak(true);
+        g_app.auto_weak = true;
+        diagnostic_log("NET", "the last Standard session on this network was choppy: Weak / hotspot for this one");
+        show_notice("Choppy here last time: using Weak / hotspot mode");
+    }
+    diagnostic_log("VIDEO", "launch profile=%s %ux%u@30 bitrate=%u kbps",
+                   stream_profile_name(), stream_profile_width(), stream_profile_height(),
+                   stream_profile_initial_bitrate());
+    diagnostic_checkpoint();
+}
+
+/* Launch records only go out with "Share performance stats" on. */
+static const char *launch_share_id(void)
+{
+    return g_app.settings.share_stats ? g_app.settings.install_id : NULL;
+}
+
+static void launch_game(const HostGame *game)
+{
+    prepare_game_session(game);
+    launch_begin(false, stream_profile_weak(), g_app.auto_weak);
+    submit_job(NET_JOB_START_SESSION, "Starting it on your PC...", NULL, &g_current_game);
+}
+
+static void release_stream_input(void)
+{
+    if (g_mouse_a_held || g_mouse_tap_held) moon_mouse_button(&g_transport, false);
+    g_mouse_a_held = g_mouse_tap_held = g_touchpad_active = false;
+    host_input_set_virtual_buttons(0);
+    host_input_set_suppressed(false);
+    g_app.stream_menu = false;
+    g_app.keyboard_open = false;
+}
+
+static void close_media(void)
+{
+    release_stream_input();
+    moon_close(&g_transport);
+}
+
+static void leave_session(void)
+{
+    diagnostic_log("APP", "user left the session");
+    g_perf.user_left = true;
+    launch_end("cancel", launch_share_id());
+    close_media();
+    if (net_worker_current_job() == NET_JOB_STOP_SESSION) {
+        g_leave_pending = false;
+        return;
+    }
+    /* If the worker is mid-request, cancel it and stop once it is free. */
+    if (net_worker_busy()) {
+        net_worker_cancel();
+        g_leave_pending = true;
+        return;
+    }
+    g_leave_pending = false;
+    submit_job(NET_JOB_STOP_SESSION, NULL, NULL, NULL);
+}
+
+/* Connect again to the app, which keeps running on the PC. */
+static void retry_session(void)
+{
+    close_media();
+    g_app.stream_frame_base = mvd_video_decoded_frames();
+    if (!g_current_game.app_id[0]) return;
+    launch_begin(true, stream_profile_weak(), g_app.auto_weak);
+    submit_job(NET_JOB_RECOVER, "Reconnecting to your PC...", NULL, &g_current_game);
+}
+
+static void save_settings(void)
+{
+    settings_apply_input(&g_app.settings);
+    if (!settings_save(&g_app.settings))
+        show_notice("Settings could not be saved to SD");
+}
+
+/* ---- Software update ------------------------------------------------------- */
+
+static char g_whats_new_notes[1600];
+
+static void start_update_check(bool quiet)
+{
+    if (host_session_active(&g_client)) return;
+    submit_job(NET_JOB_UPDATE_CHECK, quiet ? NULL : "Checking for updates...",
+               g_app.settings.update_beta ? "beta" : "stable", NULL);
+}
+
+static void open_updates(void)
+{
+    g_app.update_open = true;
+    g_app.notes_scroll = 0;
+    const UpdateInfo info = updater_info();
+    if (info.state == UPDATE_IDLE || info.state == UPDATE_UP_TO_DATE || info.state == UPDATE_FAILED)
+        start_update_check(true);
+}
+
+static void handle_updates(u32 down, u32 repeat, AppAction action)
+{
+    const UpdateInfo info = updater_info();
+    const bool working = info.state == UPDATE_CHECKING || info.state == UPDATE_DOWNLOADING ||
+                         info.state == UPDATE_VERIFYING || info.state == UPDATE_INSTALLING;
+    if (repeat & KEY_UP) g_app.notes_scroll = g_app.notes_scroll > 0 ? g_app.notes_scroll - 1 : 0;
+    if (repeat & KEY_DOWN) ++g_app.notes_scroll;
+    /* Never leave mid-install: the page shows its progress to the end. */
+    if (((down & KEY_B) || action == ACTION_UPDATE_CLOSE) && !working) {
+        g_app.update_open = false;
+        return;
+    }
+    if (((down & KEY_X) || action == ACTION_UPDATE_LATER) && info.state == UPDATE_AVAILABLE) {
+        updater_dismiss();
+        g_app.update_open = false;
+        show_notice("OK - Oboro will remind you when the next version is out");
+        return;
+    }
+    if (!(down & KEY_A) && action != ACTION_UPDATE_PRIMARY) return;
+    switch (info.state) {
+    case UPDATE_AVAILABLE:
+        if (host_session_active(&g_client)) {
+            show_notice("Finish your game first - updates never run during a session");
+            break;
+        }
+        diagnostic_log("UPDATE", "install %s requested", info.latest);
+        submit_job(NET_JOB_UPDATE_INSTALL, NULL, NULL, NULL);
+        break;
+    case UPDATE_INSTALLED:
+        /* The CIA relaunches into the new version; a .3dsx is reopened by hand. */
+        updater_relaunch();
+        g_quit = true;
+        break;
+    case UPDATE_CHECKING: case UPDATE_DOWNLOADING: case UPDATE_VERIFYING: case UPDATE_INSTALLING:
+        break;
+    default:
+        start_update_check(false);
+        break;
+    }
+}
+
+static void handle_whats_new(u32 down, u32 repeat, AppAction action)
+{
+    if (repeat & KEY_UP) g_app.notes_scroll = g_app.notes_scroll > 0 ? g_app.notes_scroll - 1 : 0;
+    if (repeat & KEY_DOWN) ++g_app.notes_scroll;
+    if ((down & (KEY_A | KEY_B | KEY_START)) || action == ACTION_WHATS_NEW_CLOSE)
+        g_app.whats_new_open = false;
+}
+
+/* Quiet daily check from the menus; never during a session. */
+static void auto_update_check(void)
+{
+    static u64 started_at;
+    if (!started_at) started_at = osGetTime();
+    if (!g_app.settings.auto_update || osGetTime() - started_at < 4000) return;
+    if (g_app.view != VIEW_LIBRARY && g_app.view != VIEW_WELCOME) return;
+    if (net_worker_busy() || host_session_active(&g_client) || !updater_check_due()) return;
+    if (updater_info().state != UPDATE_IDLE) return;
+    start_update_check(true);
+}
+
+static void change_setting(int direction)
+{
+    const int index = screens_setting_at(g_app.setting_index);
+    if (index == SETTING_ACCOUNT) {
+        if (host_has_session(&g_client))
+            open_modal(MODAL_SIGN_OUT, "解除", "FORGET THIS PC?",
+                       "The pairing and the saved app list will be removed from this console.");
+        return;
+    }
+    if (index == SETTING_GUIDE) {
+        g_app.guide_page = 0;
+        return;
+    }
+    if (index == SETTING_UPDATES) {
+        open_updates();
+        return;
+    }
+    screens_setting_change(&g_app, index, direction);
+    settings_apply_input(&g_app.settings);
+    settings_apply_picture(&g_app.settings);
+}
+
+/* ---- Pointer mode -------------------------------------------------------- */
+
+static void touchpad_begin(unsigned x, unsigned y)
+{
+    g_touchpad_active = true;
+    g_touchpad_start_x = g_touchpad_last_x = x;
+    g_touchpad_start_y = g_touchpad_last_y = y;
+    g_touchpad_started_at = osGetTime();
+    g_touchpad_travel = 0;
+}
+
+static void touchpad_move(unsigned x, unsigned y)
+{
+    if (!g_touchpad_active) return;
+    const int dx = (int)x - (int)g_touchpad_last_x;
+    const int dy = (int)y - (int)g_touchpad_last_y;
+    g_touchpad_last_x = x;
+    g_touchpad_last_y = y;
+    g_touchpad_travel += (unsigned)abs(dx) + (unsigned)abs(dy);
+    const int from_start = abs((int)x - (int)g_touchpad_start_x) +
+                           abs((int)y - (int)g_touchpad_start_y);
+    if (from_start <= 4 || (!dx && !dy)) return;
+    const unsigned width = g_transport.video_source_width ? g_transport.video_source_width : 960;
+    const unsigned height = g_transport.video_source_height ? g_transport.video_source_height : 544;
+    moon_mouse_move(&g_transport, (int16_t)(dx * (int)width / 320),
+                                (int16_t)(dy * (int)height / 192));
+}
+
+static void touchpad_end(void)
+{
+    if (!g_touchpad_active) return;
+    g_touchpad_active = false;
+    if (g_touchpad_travel > 6 || osGetTime() - g_touchpad_started_at > 450 ||
+        g_mouse_a_held || g_mouse_tap_held || !g_transport.pointer_mode ||
+        !g_transport.input_ready)
+        return;
+    if (moon_mouse_button(&g_transport, true)) {
+        g_mouse_tap_held = true;
+        g_mouse_tap_release_at = osGetTime() + 55;
+        diagnostic_log("INPUT", "touchpad tap click down");
+    }
+}
+
+static void update_pointer_click(u32 down, u32 held)
+{
+    if (g_mouse_tap_held && osGetTime() >= g_mouse_tap_release_at) {
+        moon_mouse_button(&g_transport, false);
+        g_mouse_tap_held = false;
+    }
+    const bool can_click = g_app.view == VIEW_STREAM && g_transport.pointer_mode &&
+                           !g_transport.keyboard_mode && !g_app.stream_menu &&
+                           g_transport.input_ready;
+    if (g_mouse_a_held && (!can_click || !(held & KEY_A)) &&
+        (!can_click || osGetTime() >= g_mouse_a_min_release_at)) {
+        moon_mouse_button(&g_transport, false);
+        g_mouse_a_held = false;
+    }
+    if (can_click && (down & KEY_A) && !g_mouse_a_held) {
+        if (g_mouse_tap_held) {
+            moon_mouse_button(&g_transport, false);
+            g_mouse_tap_held = false;
+        }
+        g_mouse_a_held = moon_mouse_button(&g_transport, true);
+        if (g_mouse_a_held) g_mouse_a_min_release_at = osGetTime() + 55;
+    }
+    if (!can_click) g_touchpad_active = false;
+}
+
+/* ---- Input per view ------------------------------------------------------ */
+
+static void handle_modal(u32 down, AppAction action)
+{
+    const bool confirm = (down & KEY_A) || action == ACTION_CONFIRM || action == ACTION_RETRY;
+    const bool dismiss = (down & KEY_B) || action == ACTION_DISMISS;
+    if (!confirm && !dismiss) return;
+    const AppModal modal = g_app.modal;
+    g_app.modal = MODAL_NONE;
+    if (modal == MODAL_SHARE_ASK) {
+        g_app.settings.share_reports = confirm ? SHARE_YES : SHARE_NO;
+        g_app.settings.share_stats = confirm;
+        g_app.settings.share_consent = SHARE_CONSENT_VERSION;
+        diagnostic_log("REPORT", "share diagnostics answered %s", confirm ? "yes" : "no");
+        if (!confirm) { remove(REPORT_STATS_PENDING_PATH); remove(LAUNCH_PENDING_PATH); }
+        save_settings();
+        show_notice(confirm ? "Thank you! Change it anytime in Settings > System"
+                            : "Nothing will be sent. Change it anytime in Settings > System");
+        return;
+    }
+    if (modal == MODAL_CONFLICT) {
+        if (confirm) {
+            diagnostic_log("APP", "quitting the running app to start %s", g_current_game.title);
+            submit_job(NET_JOB_END_CONFLICT, "Closing the other app on your PC...", NULL, &g_current_game);
+        } else {
+            launch_end("busy", launch_share_id());
+        }
+        return;
+    }
+    if (dismiss) return;
+    if (modal == MODAL_SEND_REPORT) {
+        submit_job(NET_JOB_SEND_REPORT, "Sending diagnostic report...", NULL, NULL);
+        return;
+    }
+    if (modal == MODAL_EXIT) {
+        g_quit = true;
+    } else if (modal == MODAL_SIGN_OUT) {
+        submit_job(NET_JOB_SIGN_OUT, NULL, NULL, NULL);
+        g_app.settings_open = false;
+        g_app.search_text[0] = '\0';
+        g_app.selected = g_app.list_top = 0;
+    } else if (modal == MODAL_ERROR && g_current_game.app_id[0]) {
+        launch_game(&g_current_game);
+    }
+}
+
+static void handle_welcome(u32 down, AppAction action)
+{
+    if ((down & KEY_A) || action == ACTION_SIGN_IN) begin_login(true);
+    else if ((down & KEY_SELECT) || action == ACTION_SETTINGS) g_app.settings_open = true;
+    else if ((down & KEY_START) || action == ACTION_EXIT)
+        open_modal(MODAL_EXIT, "終了", "EXIT OBORO?", "Return to the HOME Menu.");
+}
+
+static void handle_login(u32 down, AppAction action)
+{
+    if ((down & KEY_Y) || action == ACTION_NEW_CODE) {
+        begin_login(false);
+    } else if ((down & KEY_B) || action == ACTION_CANCEL) {
+        net_worker_cancel();
+        submit_job(NET_JOB_CANCEL_LOGIN, NULL, NULL, NULL);
+    } else if (down & KEY_START) {
+        open_modal(MODAL_EXIT, "終了", "EXIT OBORO?", "Return to the HOME Menu.");
+    }
+}
+
+/* Has this game (any of its store versions) been played on Oboro? */
+static bool game_history(const HostGame *game, PlayHistory *out)
+{
+    if (play_history_get(game->app_id, out)) return true;
+    for (unsigned v = 0; v < game->variant_count; ++v)
+        if (play_history_get(game->variants[v].id, out)) return true;
+    return false;
+}
+
+static int64_t g_recent_keys[HOST_MAX_GAMES];
+
+static int compare_recent(const void *a, const void *b)
+{
+    const int64_t ka = g_recent_keys[*(const unsigned short *)a];
+    const int64_t kb = g_recent_keys[*(const unsigned short *)b];
+    return ka < kb ? 1 : ka > kb ? -1 : 0;
+}
+
+/* The visible library list for the current tab (search results: all). */
+static void rebuild_list(void)
+{
+    const int tab = g_app.search_text[0] ? LIBRARY_TAB_ALL : g_app.library_tab;
+    size_t n = 0;
+    for (size_t i = 0; i < g_client.game_count; ++i) {
+        const HostGame *game = &g_client.games[i];
+        if (g_app.search_text[0] && !title_matches(game->title, g_app.search_text)) continue;
+        if (tab == LIBRARY_TAB_FAVOURITES && !game_prefs_favourite(game->app_id)) continue;
+        if (tab == LIBRARY_TAB_RECENT) {
+            PlayHistory history;
+            if (!game_history(game, &history)) continue;
+            g_recent_keys[i] = history.last_played;
+        }
+        g_app.list_map[n++] = (unsigned short)i;
+    }
+    if (tab == LIBRARY_TAB_RECENT) qsort(g_app.list_map, n, sizeof(g_app.list_map[0]), compare_recent);
+    g_app.list_count = n;
+    /* "Continue": the library game played most recently on Oboro. */
+    static unsigned seen_prefs = ~0u;
+    static size_t seen_count = (size_t)-1;
+    static int64_t seen_saved = -1;
+    if (seen_prefs != game_prefs_version() || seen_count != g_client.game_count ||
+        seen_saved != g_client.library_saved_at || g_app.continue_index < 0) {
+        seen_prefs = game_prefs_version();
+        seen_count = g_client.game_count;
+        seen_saved = g_client.library_saved_at;
+        int64_t best = 0;
+        g_app.continue_index = -1;
+        for (size_t i = 0; i < g_client.game_count; ++i) {
+            PlayHistory history;
+            if (game_history(&g_client.games[i], &history) && history.last_played > best) {
+                best = history.last_played;
+                g_app.continue_index = (int)i;
+            }
+        }
+    }
+    keep_selection_visible();
+}
+
+static void change_tab(int direction)
+{
+    if (g_app.search_text[0]) return;
+    g_app.library_tab = (g_app.library_tab + LIBRARY_TAB_COUNT + direction) % LIBRARY_TAB_COUNT;
+    g_app.selected = g_app.list_top = 0;
+    rebuild_list();
+}
+
+static void handle_library(u32 down, u32 repeat, AppAction action)
+{
+    const size_t count = g_app.list_count;
+    if (down & KEY_L) change_tab(-1);
+    if (down & KEY_R) change_tab(1);
+    if (count) {
+        if ((repeat & KEY_UP) || action == ACTION_PREV) {
+            if (g_app.selected > 0) --g_app.selected;
+        }
+        if ((repeat & KEY_DOWN) || action == ACTION_NEXT) {
+            if (g_app.selected + 1 < count) ++g_app.selected;
+        }
+        if (repeat & KEY_LEFT)
+            g_app.selected = g_app.selected > LIBRARY_ROWS ? g_app.selected - LIBRARY_ROWS : 0;
+        if (repeat & KEY_RIGHT)
+            g_app.selected = g_app.selected + LIBRARY_ROWS < count ? g_app.selected + LIBRARY_ROWS
+                                                                  : count - 1;
+        keep_selection_visible();
+    }
+    if (((down & KEY_START) || action == ACTION_CONTINUE) && g_app.continue_index >= 0 &&
+        !g_app.search_text[0]) {
+        const HostGame *game = &g_client.games[g_app.continue_index];
+        launch_with_options(game, game->variant_selected);
+        return;
+    }
+    if ((down & KEY_A) || action == ACTION_PLAY) {
+        if (count && g_app.selected < count) {
+            g_app.details_open = true;
+            g_app.options_open = false;
+            g_app.details_variant = app_game(&g_app, g_app.selected)->variant_selected;
+        } else if (!g_client.game_count) {
+            load_library();
+        } else {
+            g_app.library_tab = LIBRARY_TAB_ALL;
+            rebuild_list();
+        }
+    } else if ((down & KEY_X) || action == ACTION_SEARCH) {
+        search_library();
+    } else if ((down & KEY_Y) || action == ACTION_LIBRARY) {
+        /* From a search, Y returns to the full list; otherwise it refreshes. */
+        if (g_app.search_text[0]) g_app.search_text[0] = '\0';
+        else load_library();
+    } else if ((down & KEY_B) && g_app.search_text[0]) {
+        g_app.search_text[0] = '\0';
+    } else if ((down & KEY_SELECT) || action == ACTION_SETTINGS) {
+        g_app.settings_open = true;
+    } else if (down & KEY_START) {
+        open_modal(MODAL_EXIT, "終了", "EXIT OBORO?", "Return to the HOME Menu.");
+    }
+}
+
+/* ---- First-run guide ------------------------------------------------------- */
+
+static void finish_guide(void)
+{
+    g_app.guide_page = -1;
+    if (!g_app.settings.guide_done) {
+        g_app.settings.guide_done = true;
+        save_settings();
+    }
+}
+
+static void handle_guide(u32 down, AppAction action)
+{
+    if ((down & KEY_START) || action == ACTION_GUIDE_SKIP) {
+        finish_guide();
+    } else if ((down & (KEY_A | KEY_RIGHT)) || action == ACTION_GUIDE_NEXT) {
+        if (++g_app.guide_page >= GUIDE_PAGES) finish_guide();
+    } else if (((down & (KEY_B | KEY_LEFT)) || action == ACTION_GUIDE_BACK) && g_app.guide_page > 0) {
+        --g_app.guide_page;
+    }
+}
+
+/* The running game's options (its custom button map survives menu toggles). */
+static GamePrefs g_session_prefs;
+
+static void reapply_game_map(void)
+{
+    if (host_session_active(&g_client) && g_session_prefs.has_map) host_input_set_custom_map(g_session_prefs.map);
+}
+
+/* Settings for this game's session: the global ones with its options. */
+static void apply_game_options(const GamePrefs *prefs)
+{
+    AppSettings session = g_app.settings;
+    if (prefs->bitrate >= 0 && prefs->bitrate < STREAM_BITRATE_COUNT)
+        session.bitrate_mode = (StreamBitrateMode)prefs->bitrate;
+    if (prefs->gyro >= 0 && prefs->gyro < HOST_GYRO_MODE_COUNT) session.gyro_mode = (HostGyroMode)prefs->gyro;
+    if (prefs->layout >= 0 && prefs->layout < 2) session.button_layout = (HostButtonLayout)prefs->layout;
+    settings_apply_input(&session);
+    settings_apply_picture(&session);
+    /* What this game really streams with, when it differs from Settings. */
+    if (prefs->bitrate >= 0) {
+        diagnostic_log("VIDEO", "game profile=%s bitrate=%u kbps", stream_profile_name(),
+                       stream_profile_initial_bitrate());
+        if ((StreamBitrateMode)prefs->bitrate != g_app.settings.bitrate_mode)
+            show_notice("This game uses its own Bitrate (game page, X > Options)");
+    }
+    g_session_prefs = *prefs;
+    if (prefs->has_map) host_input_set_custom_map(prefs->map);
+}
+
+/* Launch a library game from one of its stores, with its own options. */
+static void launch_with_options(const HostGame *base, unsigned variant)
+{
+    if (!base) return;
+    HostGame game = *base;
+    const GamePrefs prefs = game_prefs_get(base->app_id);
+    if (variant < game.variant_count) {
+        snprintf(game.app_id, sizeof(game.app_id), "%s", game.variants[variant].id);
+        snprintf(game.store, sizeof(game.store), "%s", game.variants[variant].store);
+    }
+    launch_game(&game);
+    /* launch_game applied the global picture settings; layer this game's. */
+    apply_game_options(&prefs);
+    diagnostic_log("APP", "game options bitrate=%d gyro=%d layout=%d map=%d", prefs.bitrate, prefs.gyro,
+                   prefs.layout, prefs.has_map);
+}
+
+/* ---- Button mapping editor ---------------------------------------------- */
+
+static void open_mapping(const HostGame *game, const GamePrefs *prefs)
+{
+    (void)game;
+    const HostButtonLayout layout = prefs->layout >= 0 ? (HostButtonLayout)prefs->layout : g_app.settings.button_layout;
+    host_input_default_map(layout, g_app.settings.swap_shoulders, g_app.mapping_default);
+    memcpy(g_app.mapping, prefs->has_map ? prefs->map : g_app.mapping_default, sizeof(g_app.mapping));
+    g_app.mapping_input = HOST_IN_A;
+    g_app.mapping_open = true;
+}
+
+static void handle_mapping(u32 down, u32 repeat, AppAction action)
+{
+    const HostGame *game = app_game(&g_app, g_app.selected);
+    if (!game) { g_app.mapping_open = false; return; }
+    /* Pressing a 3DS button picks it; the Circle Pad changes what it sends
+     * (every button, D-Pad included, is itself remappable). */
+    for (unsigned i = 0; i < HOST_INPUT_COUNT; ++i)
+        if (down & host_input_key(i)) g_app.mapping_input = (int)i;
+    unsigned char *out = &g_app.mapping[g_app.mapping_input];
+    if ((repeat & KEY_CPAD_LEFT) || action == ACTION_MAP_PREV)
+        *out = (unsigned char)((*out + HOST_OUTPUT_COUNT - 1) % HOST_OUTPUT_COUNT);
+    if ((repeat & KEY_CPAD_RIGHT) || action == ACTION_MAP_NEXT)
+        *out = (unsigned char)((*out + 1) % HOST_OUTPUT_COUNT);
+    if (repeat & KEY_CPAD_UP) g_app.mapping_input = (g_app.mapping_input + HOST_INPUT_COUNT - 1) % HOST_INPUT_COUNT;
+    if (repeat & KEY_CPAD_DOWN) g_app.mapping_input = (g_app.mapping_input + 1) % HOST_INPUT_COUNT;
+    if (action == ACTION_MAP_RESET) memcpy(g_app.mapping, g_app.mapping_default, sizeof(g_app.mapping));
+    if (action == ACTION_MAP_CANCEL) g_app.mapping_open = false;
+    if (action == ACTION_MAP_DONE) {
+        GamePrefs prefs = game_prefs_get(game->app_id);
+        prefs.has_map = memcmp(g_app.mapping, g_app.mapping_default, sizeof(g_app.mapping)) != 0;
+        memcpy(prefs.map, g_app.mapping, sizeof(prefs.map));
+        game_prefs_set(game->app_id, &prefs);
+        g_app.mapping_open = false;
+        show_notice(prefs.has_map ? "Button mapping saved for this game" : "This game uses the normal layout");
+    }
+}
+
+static void handle_options(u32 down, u32 repeat, AppAction action)
+{
+    if (g_app.mapping_open) {
+        handle_mapping(down, repeat, action);
+        return;
+    }
+    const HostGame *game = app_game(&g_app, g_app.selected);
+    if (!game) { g_app.options_open = false; return; }
+    GamePrefs prefs = game_prefs_get(game->app_id);
+    if ((down & KEY_B) || action == ACTION_OPTIONS_CLOSE) { g_app.options_open = false; return; }
+    if ((action == ACTION_OPTION_PREV || action == ACTION_OPTION_NEXT) && screens_touched_option_row() >= 0)
+        g_app.options_index = screens_touched_option_row();
+    if (repeat & KEY_UP) g_app.options_index = (g_app.options_index + OPTION_COUNT - 1) % OPTION_COUNT;
+    if (repeat & KEY_DOWN) g_app.options_index = (g_app.options_index + 1) % OPTION_COUNT;
+    int step = 0;
+    if ((repeat & KEY_LEFT) || action == ACTION_OPTION_PREV) step = -1;
+    if ((repeat & KEY_RIGHT) || action == ACTION_OPTION_NEXT || (down & KEY_A)) step = 1;
+    if (!step) return;
+    /* Each option cycles "Default" (-1) then the setting's own values. */
+    #define CYCLE(value, count) value = ((value) + 1 + step + (count) + 1) % ((count) + 1) - 1
+    switch (g_app.options_index) {
+    case OPTION_BITRATE: CYCLE(prefs.bitrate, STREAM_BITRATE_COUNT); break;
+    case OPTION_GYRO: CYCLE(prefs.gyro, HOST_GYRO_MODE_COUNT); break;
+    case OPTION_LAYOUT: CYCLE(prefs.layout, 2); break;
+    case OPTION_MAPPING:
+        if ((down & KEY_A) || action == ACTION_OPTION_NEXT || action == ACTION_OPTION_PREV) open_mapping(game, &prefs);
+        return;
+    }
+    #undef CYCLE
+    game_prefs_set(game->app_id, &prefs);
+}
+
+static void handle_details(u32 down, u32 repeat, AppAction action)
+{
+    const HostGame *game = app_game(&g_app, g_app.selected);
+    if (!game) { g_app.details_open = false; return; }
+    if (g_app.options_open || action == ACTION_OPTIONS_CLOSE) {
+        handle_options(down, repeat, action);
+        return;
+    }
+    const unsigned variants = game->variant_count;
+    if ((down & KEY_A) || action == ACTION_DETAILS_PLAY) {
+        launch_with_options(app_game(&g_app, g_app.selected), g_app.details_variant);
+    } else if ((down & KEY_B) || action == ACTION_BACK) {
+        g_app.details_open = false;
+    } else if ((down & KEY_Y) || action == ACTION_FAVOURITE) {
+        GamePrefs prefs = game_prefs_get(game->app_id);
+        prefs.favourite = !prefs.favourite;
+        game_prefs_set(game->app_id, &prefs);
+        show_notice(prefs.favourite ? "Added to favourites" : "Removed from favourites");
+    } else if ((down & KEY_X) || action == ACTION_OPTIONS) {
+        g_app.options_open = true;
+        g_app.options_index = 0;
+    } else if (variants > 1 && ((repeat & KEY_LEFT) || action == ACTION_VARIANT_PREV)) {
+        g_app.details_variant = (g_app.details_variant + variants - 1) % variants;
+    } else if (variants > 1 && ((repeat & KEY_RIGHT) || action == ACTION_VARIANT_NEXT)) {
+        g_app.details_variant = (g_app.details_variant + 1) % variants;
+    } else if ((repeat & KEY_UP) && g_app.selected > 0) {
+        --g_app.selected;
+        keep_selection_visible();
+        g_app.details_variant = app_game(&g_app, g_app.selected)->variant_selected;
+    } else if ((repeat & KEY_DOWN) && g_app.selected + 1 < g_app.list_count) {
+        ++g_app.selected;
+        keep_selection_visible();
+        g_app.details_variant = app_game(&g_app, g_app.selected)->variant_selected;
+    }
+}
+
+static void handle_settings(u32 down, u32 repeat, AppAction action)
+{
+    if (repeat & KEY_UP) g_app.setting_index = (g_app.setting_index + SETTING_COUNT - 1) % SETTING_COUNT;
+    if (repeat & KEY_DOWN) g_app.setting_index = (g_app.setting_index + 1) % SETTING_COUNT;
+    if ((repeat & KEY_LEFT) || action == ACTION_VALUE_PREV) change_setting(-1);
+    if ((repeat & KEY_RIGHT) || (down & KEY_A) || action == ACTION_VALUE_NEXT) change_setting(1);
+    if ((down & (KEY_B | KEY_SELECT)) || action == ACTION_BACK) {
+        if (action == ACTION_BACK && screens_setting_at(g_app.setting_index) == SETTING_ACCOUNT &&
+            host_has_session(&g_client)) {
+            change_setting(1);
+            return;
+        }
+        save_settings();
+        g_app.settings_open = false;
+    }
+}
+
+static void handle_session(u32 down, AppAction action)
+{
+    const bool failed = g_client.session_state == HOST_SESSION_ERROR || g_transport.state == MOON_FAILED;
+    if ((down & KEY_B) || action == ACTION_CANCEL) leave_session();
+    else if (failed && ((down & KEY_A) || action == ACTION_RETRY)) {
+        g_app.reconnect_attempt = 0;
+        retry_session();
+    }
+}
+
+
+/* Stream menu "zone": save the current zoom, or clear the game's zones. */
+static void menu_zone(void)
+{
+    if (mvd_video_zoomed()) {
+        unsigned x = 50, y = 50;
+        mvd_video_zoom_position(&x, &y);
+        const unsigned n = zoom_zones_add(mvd_video_zoom_level(), x, y);
+        char text[80];
+        if (n) snprintf(text, sizeof(text), "Zoom zone %u saved - ZOOM now cycles your zones", n);
+        else snprintf(text, sizeof(text), zoom_zones_count() >= ZOOM_ZONES_MAX
+                      ? "All %d zones are used - clear them first" : "That view is already a zone",
+                      ZOOM_ZONES_MAX);
+        show_notice(text);
+        if (n) g_app.zone_index = (int)n - 1;
+    } else if (zoom_zones_count()) {
+        zoom_zones_clear();
+        g_app.zone_index = -1;
+        show_notice("Zoom zones cleared for this game");
+    } else {
+        show_notice("Zoom in with ZOOM and drag to a spot, then save it here");
+    }
+}
+
+static void handle_stream(u32 down, u32 held, AppAction action, bool touch_down,
+                          touchPosition touch)
+{
+    /* START + SELECT held opens the stream menu without leaving the game. */
+    if ((held & (KEY_START | KEY_SELECT)) == (KEY_START | KEY_SELECT)) {
+        if (!g_combo_started_at) g_combo_started_at = osGetTime();
+        else if (osGetTime() - g_combo_started_at >= MENU_COMBO_HOLD_MS && !g_app.stream_menu) {
+            g_app.stream_menu = true;
+            g_app.stream_menu_index = STREAM_MENU_RESUME;
+        }
+    } else {
+        g_combo_started_at = 0;
+    }
+
+    if (g_transport.keyboard_mode) {
+        bool close = remote_keyboard_buttons(&g_transport, down);
+        if (touch_down) close |= remote_keyboard_touch(&g_transport, touch.px, touch.py);
+        if (close) g_transport.keyboard_mode = false;
+        return;
+    }
+
+    if (g_app.controls_open) {
+        if ((down & (KEY_A | KEY_B | KEY_SELECT)) || action == ACTION_CONTROLS_CLOSE)
+            g_app.controls_open = false;
+        return;
+    }
+
+    if (g_app.stream_menu) {
+        /* Two columns: up/down move a row, left/right a column. */
+        if ((down & KEY_UP) && g_app.stream_menu_index >= 2) g_app.stream_menu_index -= 2;
+        if ((down & KEY_DOWN) && g_app.stream_menu_index + 2 < STREAM_MENU_COUNT) g_app.stream_menu_index += 2;
+        if ((down & KEY_LEFT) && (g_app.stream_menu_index & 1)) --g_app.stream_menu_index;
+        if ((down & KEY_RIGHT) && !(g_app.stream_menu_index & 1)) ++g_app.stream_menu_index;
+        if (down & KEY_A) action = (AppAction)(ACTION_MENU_RESUME + g_app.stream_menu_index);
+        if (down & KEY_B) action = ACTION_MENU_RESUME;
+        if (action == ACTION_MENU_RESUME) {
+            g_app.stream_menu = false;
+        } else if (action == ACTION_MENU_CONTROLS) {
+            g_app.stream_menu = false;
+            g_app.controls_open = true;
+        } else if (action == ACTION_MENU_SCREENSHOT) {
+            g_app.stream_menu = false;
+            g_screenshot_requested = true;
+        } else if (action == ACTION_MENU_ZONE) {
+            menu_zone();
+        } else if (action == ACTION_MENU_SOUND) {
+            g_app.sound_muted = !g_app.sound_muted;
+        } else if (action == ACTION_MENU_GYRO) {
+            screens_setting_change(&g_app, SETTING_GYRO, 1);
+            settings_apply_input(&g_app.settings);
+            reapply_game_map();
+            save_settings();
+        } else if (action == ACTION_MENU_LAYOUT) {
+            screens_setting_change(&g_app, SETTING_LAYOUT, 1);
+            save_settings();
+
+        } else if (action == ACTION_MENU_DISCONNECT) {
+            leave_session();
+        }
+        return;
+    }
+
+    switch (action) {
+    case ACTION_STREAM_KEYBOARD:
+        g_transport.keyboard_mode = true;
+        remote_keyboard_open();
+        return;
+    case ACTION_STREAM_POINTER:
+        moon_set_pointer_mode(&g_transport, !g_transport.pointer_mode);
+        return;
+    case ACTION_STREAM_ZOOM:
+        /* With saved zones, ZOOM steps through them (then back to full). */
+        if (zoom_zones_count()) {
+            g_app.zone_index = g_app.zone_index + 1 >= (int)zoom_zones_count() ? -1 : g_app.zone_index + 1;
+            const ZoomZone *z = g_app.zone_index >= 0 ? zoom_zones_get((unsigned)g_app.zone_index) : NULL;
+            mvd_video_set_zoom(z ? z->level : 0, z ? z->x : 50, z ? z->y : 50);
+        } else {
+            mvd_video_toggle_zoom();
+        }
+        return;
+    case ACTION_STREAM_MENU:
+        g_app.stream_menu = true;
+        g_app.stream_menu_index = STREAM_MENU_RESUME;
+        return;
+    default: break;
+    }
+
+    /* Tapping the stats tiles turns the page: stream, PC, PC, console. */
+    if (touch_down && !g_transport.pointer_mode && !mvd_video_zoomed() && g_app.settings.show_stats &&
+        ui_hit(screens_stream_panel(), touch.px, touch.py))
+        g_app.stats_page = (g_app.stats_page + 1) % STATS_PAGES;
+
+    /* Centre panel: touchpad in pointer mode, otherwise the zoom map. */
+    const UiRect panel = screens_stream_panel();
+    if (held & KEY_TOUCH) {
+        if (g_transport.pointer_mode) {
+            if (touch_down && ui_hit(panel, touch.px, touch.py) && g_transport.input_ready)
+                touchpad_begin(touch.px, touch.py);
+            else touchpad_move(touch.px, touch.py);
+        } else if (mvd_video_zoomed() && ui_hit(panel, touch.px, touch.py)) {
+            const float frame_w = panel.w - 8, frame_h = frame_w * 9 / 16;
+            float nx = (touch.px - panel.x - 4) / frame_w, ny = (touch.py - panel.y - 6) / frame_h;
+            if (nx < 0) nx = 0;
+            if (nx > 1) nx = 1;
+            if (ny < 0) ny = 0;
+            if (ny > 1) ny = 1;
+            mvd_video_pan_to((unsigned)(nx * 1000), (unsigned)(ny * 1000));
+        }
+    }
+}
+
+static const char *current_status(void);
+static void queue_auto_report(const char *trigger);
+
+/* ---- Session tracking ------------------------------------------------------ */
+
+/* Lid closed or HOME opened: the app is frozen and the stream times out.
+ * The hook only records when and why; track_session() logs it and
+ * reconnects afterwards. */
+static volatile u64 g_suspended_at, g_resumed_at;
+static volatile bool g_suspend_was_sleep;
+static aptHookCookie g_apt_cookie;
+
+static void apt_hook(APT_HookType hook, void *param)
+{
+    (void)param;
+    if (hook == APTHOOK_ONSLEEP || hook == APTHOOK_ONSUSPEND) {
+        moon_pause(true);
+        g_suspended_at = osGetTime();
+        g_suspend_was_sleep = hook == APTHOOK_ONSLEEP;
+    } else if (hook == APTHOOK_ONWAKEUP || hook == APTHOOK_ONRESTORE) {
+        moon_pause(false);
+        g_resumed_at = osGetTime();
+    }
+}
+
+static bool g_history_open;
+
+static void finish_history(void)
+{
+    if (!g_history_open) return;
+    g_history_open = false;
+    const u64 played = g_app.stream_started_at ? osGetTime() - g_app.stream_started_at : 0;
+    play_history_end(g_current_game.app_id, (uint32_t)(played / 1000));
+}
+
+/* Connected to an access point (ac:u), checked at most twice a second. */
+static bool wifi_connected(void)
+{
+    static u64 checked_at;
+    static bool connected = true;
+    const u64 now = osGetTime();
+    if (now - checked_at >= 500) {
+        checked_at = now;
+        u32 status = 0;
+        connected = R_SUCCEEDED(ACU_GetWifiStatus(&status)) && status != 0;
+    }
+    return connected;
+}
+
+/* Once per game, after 90 s: a ping or loss that Standard mode on this
+ * server can't carry (beta.23: 17 of 67 sessions averaged over 100 ms). */
+static void connection_hint(u64 now)
+{
+    static u64 hinted_for;
+    if (hinted_for == g_app.stream_started_at || !g_app.stream_started_at || g_perf.weak) return;
+    const u64 played = now - g_app.stream_started_at;
+    if (played < 90000 || !g_perf.ping_samples) return;
+    const unsigned ping = (unsigned)(g_perf.ping_sum / g_perf.ping_samples);
+    const unsigned lost_per_min = (unsigned)((u64)g_perf.lost * 60000u / played);
+    if (ping < 120 && lost_per_min < 6) return;
+    hinted_for = g_app.stream_started_at;
+    diagnostic_log("APP", "connection hint shown ping=%u lostPerMin=%u", ping, lost_per_min);
+    show_notice(ping >= 120 ? "High ping: move closer to the router, or try Weak / hotspot (Settings > Network)"
+                            : "Choppy? Try Weak / hotspot in Settings > Network");
+}
+
+/* "Pause": with the lid shut the stream stays connected but the sound and
+ * the controls are held; opening it shows a short "Welcome back" card. */
+static void track_lid_pause(bool paused)
+{
+    static u64 paused_at;
+    if (paused == g_app.lid_paused) return;
+    g_app.lid_paused = paused;
+    const u64 now = osGetTime();
+    if (paused) {
+        paused_at = now;
+        g_app.welcome_at = 0;
+        diagnostic_log("APP", "lid closed: paused, connection kept");
+        return;
+    }
+    const u64 away = paused_at ? now - paused_at : 0;
+    const bool dropped = g_transport.state == MOON_FAILED;
+    diagnostic_log("APP", "lid opened after %llu ms: %s", (unsigned long long)away,
+                   dropped ? "connection dropped, reconnecting" : "resumed without reconnecting");
+    if (away >= 1500 && !dropped) {
+        g_app.welcome_at = now;
+        g_app.welcome_away_s = (unsigned)(away / 1000);
+    }
+    paused_at = 0;
+}
+
+/* Lid shut while connecting, or mid-game with sleep held off ("Pause" and
+ * "Keep playing"): screens off to save battery. */
+static void track_lid(void)
+{
+    static u64 lid_checked_at;
+    const u64 now = osGetTime();
+    if (now - lid_checked_at < 400) return;
+    lid_checked_at = now;
+    const bool closed = queue_alert_lid_closed();
+    const bool session = host_session_active(&g_client);
+    const bool waiting = session && !g_app.stream_started_at;
+    const bool playing = session && g_app.stream_started_at && g_app.settings.lid_mode != LID_SLEEP;
+    queue_alert_screens((waiting || playing) && closed);
+    track_lid_pause(playing && closed && g_app.settings.lid_mode == LID_PAUSE);
+}
+
+/* The 3DS keeps doing background Wi-Fi work (StreetPass, SpotPass and
+ * notification checks) while an app streams, and each scan takes the radio
+ * off the access point for a moment: the stream stops for 200-280 ms at a
+ * time and frames are lost. Like Moonlight-N3DS, the Wi-Fi is taken
+ * exclusively (infrastructure only, background daemons stopped), but only
+ * while a game session runs. */
+static void wifi_exclusive(bool on)
+{
+    if (!g_ndm_ready || on == g_ndm_exclusive) return;
+    Result result;
+    if (on) {
+        result = NDMU_EnterExclusiveState(NDM_EXCLUSIVE_STATE_INFRASTRUCTURE);
+        if (R_SUCCEEDED(result)) result = NDMU_LockState();
+        g_ndm_exclusive = R_SUCCEEDED(result);
+        if (!g_ndm_exclusive) NDMU_LeaveExclusiveState();
+    } else {
+        NDMU_UnlockState();
+        result = NDMU_LeaveExclusiveState();
+        g_ndm_exclusive = false;
+    }
+    diagnostic_log("NET", "exclusive Wi-Fi %s rc=%08lX", on ? "on" : "off", (unsigned long)result);
+}
+
+/* Timer, free-tier warnings and automatic reconnects for a running session. */
+static void track_session(void)
+{
+    static u64 reconnect_at, playing_since;
+    const u64 now = osGetTime();
+
+    track_lid();
+    char shot[64];
+    const int shot_result = screenshot_poll(shot, sizeof(shot));
+    if (shot_result > 0) {
+        char text[96];
+        snprintf(text, sizeof(text), "Screenshot saved: %s", shot);
+        show_notice(text);
+    } else if (shot_result < 0) {
+        show_notice("Screenshot could not be saved to the SD card");
+    }
+    audio_output_set_muted(g_app.sound_muted || g_app.lid_paused ||
+                           (g_app.settings.mute_in_menus && (g_app.stream_menu || g_app.controls_open)));
+
+    static bool was_active;
+    wifi_exclusive(host_session_active(&g_client));
+    if (!host_session_active(&g_client)) {
+        finish_history();
+        if (g_perf.active) {
+            perf_end(g_app.settings.install_id);
+            /* A Weak session Oboro chose by itself counts for the network: when it
+             * went smoothly, the next session there tries Standard again. */
+            /* Not a Sharp (test) session: a stress test that loses packets on
+             * purpose put the next ordinary session into Weak (beta.25 test). */
+            if (!stream_profile_test_mode())
+                net_memory_note(g_perf.weak && !g_app.auto_weak, g_perf.seconds, g_perf.lost, g_perf.repeated);
+            /* A clearly choppy session on Standard: point at Weak / hotspot
+             * (beta.17 stats: one console lost ~5 frames a minute). */
+            const unsigned minutes = g_perf.seconds / 60;
+            if (minutes >= 2 && !g_app.settings.net_weak &&
+                (g_perf.lost / minutes >= 3 || g_perf.repeated / minutes >= 15))
+                show_notice("Choppy connection? Try Settings > Network > Connection type: Weak / hotspot");
+        }
+        /* A game's own options only last for its session. */
+        if (was_active) {
+            was_active = false;
+            settings_apply_input(&g_app.settings);
+            settings_apply_picture(&g_app.settings);
+        }
+        playing_since = 0;
+        g_resumed_at = 0;
+        return;
+    }
+    /* Back from sleep or the HOME Menu after more than a few seconds: the
+     * media has timed out, so reconnect straight away (once Wi-Fi is back)
+     * instead of waiting for the connection to be declared dead. */
+    if (g_resumed_at && g_app.stream_started_at) {
+        /* Only a pause during this stream counts: an older timestamp would
+         * make a short HOME visit look like minutes away. */
+        const bool paired = g_suspended_at >= g_app.stream_started_at && g_resumed_at > g_suspended_at;
+        const u64 away = paired ? g_resumed_at - g_suspended_at : 0;
+        if (away < 4000) {
+            if (paired)
+                diagnostic_log("APP", "system %s for %llu ms; stream kept", g_suspend_was_sleep ? "sleep" : "HOME/applet",
+                               (unsigned long long)away);
+            g_resumed_at = g_suspended_at = 0;
+        } else if ((osGetWifiStrength() > 0 || now - g_resumed_at > 15000) && !net_worker_busy() &&
+                   g_client.session_state == HOST_SESSION_READY) {
+            diagnostic_log("APP", "resumed after %llu ms away (system %s, lid=%s); reconnecting",
+                           (unsigned long long)away, g_suspend_was_sleep ? "sleep" : "HOME/applet",
+                           queue_alert_lid_closed() ? "closed" : "open");
+            g_resumed_at = g_suspended_at = 0;
+            g_app.reconnect_attempt = 1;
+            reconnect_at = now;
+            show_notice("Welcome back - reconnecting to your PC");
+            ++g_perf.reconnects;
+            retry_session();
+            return;
+        }
+    }
+    was_active = true;
+    if (g_app.view == VIEW_STREAM) {
+        if (!g_app.stream_started_at) {
+            g_app.stream_started_at = now;
+            diagnostic_log("APP", "stream started");
+            launch_end("ok", launch_share_id());
+            perf_begin(g_current_game.title, "", stream_profile_weak(), (unsigned)g_app.settings.bitrate_mode);
+            play_history_begin(g_current_game.app_id, g_current_game.title);
+            g_history_open = true;
+        }
+        if (!playing_since) playing_since = now;
+        connection_hint(now);
+        /* Ten clean seconds after a reconnect: the next drop starts afresh. */
+        if (g_app.reconnect_attempt && now - playing_since >= 10000) g_app.reconnect_attempt = 0;
+    } else {
+        playing_since = 0;
+    }
+    /* The app was quit on the PC (or from its own menu): a normal end. */
+    if (g_transport.ended && !g_leave_pending) {
+        diagnostic_log("APP", "the PC ended the session");
+        show_notice("The app was closed on your PC");
+        leave_session();
+        return;
+    }
+
+    /* A dropped connection mid-game: the app still runs on the PC, so
+     * reconnect instead of sending the player back to the library. */
+    /* Video frozen for 12 s with nothing else wrong (no lid, Wi-Fi up): the
+     * keyframe requests (every 3 s) have not helped, so reconnect. */
+    /* The video thread can stamp a frame after `now` was read: unsigned
+     * now - last then wrapped to 2^64 and every such reconnect in beta.23
+     * reports was bogus (one broke a working game). */
+    const u64 last_frame = g_transport.last_decoded_frame_at;
+    const bool frozen = g_app.view == VIEW_STREAM && g_transport.state == MOON_CONNECTED &&
+                        last_frame && now > last_frame && now - last_frame > 12000 &&
+                        !g_app.lid_paused && !g_resumed_at && wifi_connected();
+    if (frozen && !net_worker_busy() && g_client.session_state == HOST_SESSION_READY && g_app.reconnect_attempt < 3) {
+        diagnostic_log("APP", "video frozen for %llu ms; reconnecting",
+                       (unsigned long long)(now - g_transport.last_decoded_frame_at));
+        g_transport.last_decoded_frame_at = now;
+        ++g_app.reconnect_attempt;
+        reconnect_at = now;
+        ++g_perf.reconnects;
+        show_notice("Video froze - reconnecting");
+        retry_session();
+        return;
+    }
+    const bool dropped = g_transport.state == MOON_FAILED;
+    static u64 wifi_wait_since, wifi_back_at;
+    if (!dropped) {
+        g_app.waiting_wifi = false;
+        wifi_wait_since = wifi_back_at = 0;
+    }
+    if (!dropped || !g_app.stream_started_at || g_leave_pending || net_worker_busy()) return;
+    if (g_client.session_state != HOST_SESSION_READY || g_app.reconnect_attempt > 3) return;
+    /* No Wi-Fi (lid shut, or out of range): retrying now only burns the
+     * three attempts on "Couldn't resolve host name". Wait for the lid to
+     * open and Wi-Fi to come back (up to 30 s), then let it settle. */
+    if (g_app.lid_paused || !wifi_connected()) {
+        if (!wifi_wait_since) {
+            wifi_wait_since = now;
+            diagnostic_log("APP", "connection lost with %s; waiting before reconnecting",
+                           g_app.lid_paused ? "the lid closed" : "Wi-Fi off");
+        }
+        wifi_back_at = 0;
+        if (g_app.lid_paused || now - wifi_wait_since < 30000) {
+            g_app.waiting_wifi = true;
+            return;
+        }
+    } else if (wifi_wait_since) {
+        if (!wifi_back_at) {
+            wifi_back_at = now;
+            diagnostic_log("APP", "Wi-Fi back after %llu ms", (unsigned long long)(now - wifi_wait_since));
+        }
+        if (now - wifi_back_at < 1500) return;
+        wifi_wait_since = wifi_back_at = 0;
+        g_app.reconnect_attempt = 0;
+    }
+    g_app.waiting_wifi = false;
+    if (reconnect_at && now - reconnect_at < 2500 && g_app.reconnect_attempt) return;
+    if (g_app.reconnect_attempt == 3) {
+        /* Three tries failed: hand the choice back to the player. */
+        if (now - reconnect_at >= 8000) {
+            g_app.reconnect_attempt = 4;
+            queue_auto_report("reconnect-failed");
+            perf_note_error("reconnect-failed");
+        }
+        return;
+    }
+    reconnect_at = now;
+    ++g_app.reconnect_attempt;
+    diagnostic_log("APP", "connection lost (%s); reconnect attempt %u", g_transport.status, g_app.reconnect_attempt);
+    show_notice("Connection lost - reconnecting");
+    ++g_perf.reconnects;
+    retry_session();
+}
+
+/* ---- Main ------------------------------------------------------------------ */
+
+static void wait_for_media(int timeout_ms)
+{
+    /* Packets on core 2 when it runs there, else the media socket. */
+    moon_wait(&g_transport, timeout_ms);
+}
+
+static void tick_network(void)
+{
+    /* The app is launched: connect the stream on the worker (the Moonlight
+     * handshake blocks for a few seconds). */
+    if (g_client.session_state == HOST_SESSION_READY && g_transport.state == MOON_IDLE &&
+        !net_worker_busy() && !g_leave_pending)
+        submit_job(NET_JOB_START_STREAM, NULL, NULL, NULL);
+    moon_tick(&g_transport);
+}
+
+/* The status strip shows whichever layer is currently doing the work. */
+static const char *current_status(void)
+{
+    if (g_notice[0] && osGetTime() < g_notice_until) return g_notice;
+    if (g_transport.active) return g_transport.status;
+    return g_client.status;
+}
+
+/* ---- Diagnostic reports ---------------------------------------------------- */
+
+/* Automatic reports (Share diagnostics on): one per run, sent from the menus
+ * once nothing else is happening, never during a game. */
+static const char *g_auto_trigger;
+static bool g_auto_sent, g_auto_inflight;
+
+static void queue_auto_report(const char *trigger)
+{
+    if (g_auto_sent || g_auto_trigger || !report_available()) return;
+    g_auto_trigger = trigger;
+    diagnostic_log("REPORT", "automatic report queued (%s)", trigger);
+}
+
+static void auto_report_tick(void)
+{
+    if (!g_auto_trigger || g_auto_sent || g_app.settings.share_reports != SHARE_YES) return;
+    if ((g_app.view != VIEW_LIBRARY && g_app.view != VIEW_WELCOME) || host_session_active(&g_client) ||
+        net_worker_busy() || g_app.modal != MODAL_NONE)
+        return;
+    if (submit_job(NET_JOB_SEND_REPORT, NULL, g_auto_trigger, NULL)) {
+        g_auto_sent = g_auto_inflight = true;
+        g_auto_trigger = NULL;
+    }
+}
+
+/* A finished session's summary goes out from the menus when idle. */
+static bool g_stats_inflight, g_stats_failed;
+
+static void stats_tick(void)
+{
+    static u64 tried_at;
+    if (!g_app.settings.share_stats || !report_available() || g_stats_inflight) return;
+    if ((g_app.view != VIEW_LIBRARY && g_app.view != VIEW_WELCOME) || host_session_active(&g_client) ||
+        net_worker_busy() || g_app.modal != MODAL_NONE)
+        return;
+    const u64 now = osGetTime();
+    if (tried_at && now - tried_at < (g_stats_failed ? 600000u : 60000u)) return;
+    if (!report_stats_pending()) return;
+    tried_at = now;
+    if (submit_job(NET_JOB_SEND_STATS, NULL, NULL, NULL)) g_stats_inflight = true;
+}
+
+/* Before the first frame, a failed connection is retried by itself, twice
+ * (a PC waking its display or encoder can refuse the first handshake). */
+#define SETUP_RETRIES 2
+
+static void setup_retry_tick(void)
+{
+    if (!host_session_active(&g_client) || g_app.stream_started_at || g_leave_pending || net_worker_busy() ||
+        g_client.session_state != HOST_SESSION_READY)
+        return;
+    if (g_transport.state != MOON_FAILED || g_app.setup_retries >= SETUP_RETRIES) return;
+    ++g_app.setup_retries;
+    diagnostic_log("APP", "connection failed before the stream (%.80s); automatic retry %u",
+                   g_transport.status, g_app.setup_retries);
+    show_notice("Connection failed - trying again");
+    retry_session();
+}
+
+/* A session that still fails before its first frame, after those retries. */
+static void watch_session_errors(void)
+{
+    static bool was_error;
+    const bool error = host_session_active(&g_client) && !g_app.stream_started_at &&
+                       g_transport.state == MOON_FAILED && g_app.setup_retries >= SETUP_RETRIES;
+    if (error && !was_error) {
+        diagnostic_log("APP", "session failed: %.120s", g_transport.status);
+        queue_auto_report("setup-failed");
+        perf_note_error("session-error");
+        launch_end("setup", launch_share_id());
+    }
+    was_error = error;
+}
+
+/* Asked once per console, when the menus are quiet. */
+static void share_prompt_tick(void)
+{
+    static bool asked;
+    if (asked || g_app.settings.share_consent >= SHARE_CONSENT_VERSION || !report_available()) return;
+    if ((g_app.view != VIEW_LIBRARY && g_app.view != VIEW_WELCOME) || g_app.whats_new_open ||
+        g_app.guide_page >= 0 || g_app.update_open || g_app.modal != MODAL_NONE || g_app.busy)
+        return;
+    asked = true;
+    open_modal(MODAL_SHARE_ASK, "協力", "HELP IMPROVE OBORO?", "");
+}
+
+/* A launch failed: ask about an app in the way, or show the error. */
+static void launch_failed(void)
+{
+    if (g_client.conflict_found) {
+        char other[112] = "Another app";
+        for (size_t i = 0; i < g_client.game_count; ++i)
+            if (!strcmp(g_client.games[i].app_id, g_client.conflict.app_id))
+                snprintf(other, sizeof(other), "%.40s", g_client.games[i].title);
+        char text[sizeof(g_app.modal_text)];
+        snprintf(text, sizeof(text), "%s is running on your PC. Quit it and start %.40s? "
+                 "Unsaved progress in it is lost.", other, g_current_game.title);
+        open_modal(MODAL_CONFLICT, "使用中", "PC IS BUSY", text);
+        return;
+    }
+    open_modal(MODAL_ERROR, "起動失敗", "LAUNCH FAILED", g_client.status);
+    queue_auto_report("launch-failed");
+    launch_end(g_client.fail_code[0] ? g_client.fail_code : "error", launch_share_id());
+}
+
+/* React to a worker job that just finished. */
+static void finish_jobs(void)
+{
+    static unsigned seen_serial;
+    const NetJobResult result = net_worker_last_result();
+    if (result.serial == seen_serial) return;
+    seen_serial = result.serial;
+    if (result.cancelled && !background_job(result.kind)) {
+        show_notice("Cancelled");
+    } else if ((result.kind == NET_JOB_START_SESSION || result.kind == NET_JOB_END_CONFLICT) && !result.ok) {
+        launch_failed();
+    } else if (result.kind == NET_JOB_RECOVER && !result.ok) {
+        /* The PC stopped answering: back to the library, with the reason. */
+        open_modal(MODAL_ERROR, "切断", "CONNECTION LOST", g_client.status);
+    }
+    if (result.kind == NET_JOB_LOAD_LIBRARY) g_app.selected = g_app.list_top = 0;
+    if (result.kind == NET_JOB_SEND_STATS) {
+        g_stats_inflight = false;
+        g_stats_failed = !result.ok;
+    }
+    if (result.kind == NET_JOB_SEND_REPORT && g_auto_inflight) {
+        g_auto_inflight = false;
+        if (result.ok) {
+            char text[64];
+            snprintf(text, sizeof(text), "Diagnostic report sent · %s", report_code());
+            show_notice(text);
+        }
+    } else if (result.kind == NET_JOB_SEND_REPORT && !result.cancelled) {
+        if (result.ok) {
+            snprintf(g_app.report_code, sizeof(g_app.report_code), "%s", report_code());
+            open_modal(MODAL_REPORT_SENT, "送信完了", "REPORT SENT",
+                       "Share this code in your bug report so the developer can find your report.");
+        } else {
+            char text[96];
+            snprintf(text, sizeof(text), "Report not sent: %.70s", report_error());
+            show_notice(text);
+        }
+    }
+    if (result.kind == NET_JOB_UPDATE_CHECK) {
+        const UpdateInfo info = updater_info();
+        if (info.state == UPDATE_AVAILABLE && !updater_dismissed() && !g_app.update_open) {
+            /* Show the update itself (notes, Install / Later) when nothing
+             * else is on screen; a toast was easy to miss (beta.18). */
+            const bool quiet = (g_app.view == VIEW_LIBRARY || g_app.view == VIEW_WELCOME) &&
+                               g_app.modal == MODAL_NONE && !g_app.whats_new_open && g_app.guide_page < 0 &&
+                               !host_session_active(&g_client) && !g_app.settings_open;
+            if (quiet) {
+                diagnostic_log("UPDATE", "showing %s", info.latest);
+                open_updates();
+            } else {
+                char text[96];
+                snprintf(text, sizeof(text), "Oboro %s is available - Settings > Updates", info.latest);
+                show_notice(text);
+            }
+        }
+    }
+    if (g_leave_pending && !net_worker_busy()) leave_session();
+    run_deferred_job();
+}
+
+static void log_session(void)
+{
+    static u64 last;
+    /* Once video plays, every 5 s: long sessions must not flood the log. */
+    const u64 interval = g_app.view == VIEW_STREAM ? 5000 : 1000;
+    if (!host_session_active(&g_client) || osGetTime() - last < interval) return;
+    last = osGetTime();
+    diagnostic_log("SESSION", "state=%d moon=%d video=%u kbps=%u fps=%u idr=%u keyreq=%u rtt=%d audio=%u decoded=%u drop=%u err=%u input=%u mouse=%u clicks=%u keys=%u conceal=%u",
+        g_client.session_state, g_transport.state, g_transport.video_access_units, g_transport.video_kbps,
+        g_transport.video_fps, g_transport.video_idr_units, g_transport.keyframe_requests, g_transport.rtt_ms,
+        g_transport.audio_packets, g_transport.audio_decoded, g_transport.audio_dropped, g_transport.audio_errors,
+        g_transport.input_reports, g_transport.mouse_moves, g_transport.mouse_clicks, g_transport.keyboard_keys,
+        audio_output_concealed());
+}
+
+static void fatal_screen(const char *title, const char *message)
+{
+    g_app.status = message;
+    open_modal(MODAL_EXIT, "エラー", title, message);
+    g_app.view = VIEW_WELCOME;
+    while (aptMainLoop() && !g_quit) {
+        hidScanInput();
+        if (hidKeysDown() & (KEY_A | KEY_B | KEY_START)) break;
+        render(true);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    gfxInitDefault();
+    gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+    /* One top framebuffer: MVD frames are written into it directly. */
+    gfxSetDoubleBuffering(GFX_TOP, false);
+    if (!ui_init()) {
+        gfxExit();
+        return 1;
+    }
+    g_app.client = &g_client;
+    g_app.transport = &g_transport;
+    g_app.current_game = &g_current_game;
+    g_app.zone_index = -1;
+    game_art_init();
+    settings_load(&g_app.settings);
+    if (!g_app.settings.install_id[0]) {
+        /* Anonymous: random, made here, not linked to any account. */
+        srand((unsigned)(svcGetSystemTick() ^ osGetTime()));
+        snprintf(g_app.settings.install_id, sizeof(g_app.settings.install_id), "%04x%04x%04x",
+                 rand() & 0xFFFF, rand() & 0xFFFF, rand() & 0xFFFF);
+        settings_save(&g_app.settings);
+    }
+    g_app.guide_page = g_app.settings.guide_done ? -1 : 0;
+    settings_apply_input(&g_app.settings);
+    settings_apply_picture(&g_app.settings);
+    hidSetRepeatParameters(18, 5);
+
+    bool is_new_3ds = false;
+    const Result model_result = APT_CheckNew3DS(&is_new_3ds);
+    if (R_FAILED(model_result) || !is_new_3ds) {
+        fatal_screen("NEW 3DS REQUIRED",
+                     "Oboro needs a New 3DS, New 3DS XL or New 2DS XL for its video decoder.");
+        ui_exit();
+        gfxExit();
+        return 1;
+    }
+
+    osSetSpeedupEnable(true);
+    char init_error[128] = "";
+    if (!init_services(init_error, sizeof(init_error))) {
+        fatal_screen("STARTUP FAILED", init_error);
+        shutdown_services();
+        ui_exit();
+        gfxExit();
+        return 1;
+    }
+
+    app_paths_migrate();
+    diagnostic_init();
+    diagnostic_log("APP", "startup model=%s wifiBars=%u linearFreeKiB=%lu",
+                   is_new_3ds ? "new3ds-family" : "old3ds-family",
+                   osGetWifiStrength(), (unsigned long)(linearSpaceFree() / 1024));
+    /* The last run of this version never reached a normal exit. */
+    if (report_previous_run_unclean()) {
+        diagnostic_log("APP", "previous run did not exit cleanly");
+        queue_auto_report("unclean-exit");
+    }
+    moon_init(&g_transport);
+    host_client_init(&g_client);
+    /* The saved library appears instantly; covers keep filling in behind. */
+    if (host_has_session(&g_client) && host_library_load(&g_client))
+        game_art_prefetch(g_client.games, (unsigned)g_client.game_count);
+    if (!host_input_self_test()) {
+        diagnostic_log("INPUT", "wire encoder self-test FAILED");
+        show_notice("Input packet self-test failed");
+    }
+    /* Audio driver now, while nothing else is running (see audio_output.c). */
+    audio_system_init();
+    play_history_load();
+    game_prefs_load();
+    g_app.continue_index = -1;
+    updater_init(argc > 0 && argv ? argv[0] : NULL);
+    /* First start of a freshly installed version: show what changed, once. */
+    if (updater_take_whats_new(g_app.whats_new_version, sizeof(g_app.whats_new_version),
+                               g_whats_new_notes, sizeof(g_whats_new_notes))) {
+        g_app.whats_new_open = true;
+        g_app.whats_new_notes = g_whats_new_notes;
+    }
+    aptHook(&g_apt_cookie, apt_hook, NULL);
+    queue_alert_stop();
+    if (!net_worker_start(&g_client, &g_transport)) {
+        fatal_screen("STARTUP FAILED", "Could not start the network worker thread.");
+        shutdown_services();
+        ui_exit();
+        gfxExit();
+        return 1;
+    }
+    bool sleep_allowed = true;
+
+    bool was_touching = false;
+    u64 last_bottom_draw = 0;
+    u64 loop_started = osGetTime();
+    while (aptMainLoop() && !g_quit) {
+        {
+            const u64 loop_now = osGetTime();
+            const unsigned loop_ms = loop_now > loop_started ? (unsigned)(loop_now - loop_started) : 0;
+            loop_started = loop_now;
+            if (g_app.view == VIEW_STREAM && loop_ms < 5000) {
+                if (loop_ms > g_loop_max_ms) g_loop_max_ms = loop_ms;
+                if (loop_ms > 25) {
+                    ++g_loop_slow;
+                    ++g_perf.slow_loops;
+                }
+                if (loop_ms > g_perf.loop_max_ms) g_perf.loop_max_ms = loop_ms;
+            }
+        }
+        net_worker_sync(&g_client);
+        finish_jobs();
+        g_app.busy = net_worker_busy() ? g_busy_message : NULL;
+        hidScanInput();
+        const u32 down = hidKeysDown();
+        const u32 held = hidKeysHeld();
+        const u32 repeat = hidKeysDownRepeat();
+        touchPosition touch = {0, 0};
+        if (held & KEY_TOUCH) hidTouchRead(&touch);
+        const bool touch_down = (down & KEY_TOUCH) != 0;
+        g_app.touching = (held & KEY_TOUCH) != 0;
+        g_app.touch_x = touch.px;
+        g_app.touch_y = touch.py;
+
+        const AppView previous_view = g_app.view;
+        g_app.view = derive_view();
+        if (previous_view == VIEW_STREAM && g_app.view != VIEW_STREAM) release_stream_input();
+        g_app.keyboard_open = g_transport.keyboard_mode;
+
+        if (g_app.view == VIEW_LIBRARY || g_app.view == VIEW_DETAILS) rebuild_list();
+        const AppAction action = touch_down ? screens_touch(&g_app, touch.px, touch.py) : ACTION_NONE;
+        if (g_app.view != VIEW_STREAM) {
+            auto_update_check();
+            share_prompt_tick();
+            auto_report_tick();
+            stats_tick();
+        }
+        if (g_app.whats_new_open && g_app.view != VIEW_STREAM) {
+            handle_whats_new(down, repeat, action);
+        } else if (g_app.guide_page >= 0 && g_app.view != VIEW_STREAM && !g_app.busy) {
+            handle_guide(down, action);
+        } else if (g_app.update_open && g_app.view != VIEW_STREAM && !g_app.busy) {
+            handle_updates(down, repeat, action);
+        } else if (g_app.busy) {
+            /* The UI stays live during requests; B cancels what can be
+             * cancelled, but never the request that ends the session on
+             * the PC's side (players pressing B while leaving got
+             * "Session stop network: Cancelled", and the game stayed open). */
+            if ((down & KEY_B) && net_worker_current_job() != NET_JOB_STOP_SESSION) net_worker_cancel();
+        } else if (g_app.modal != MODAL_NONE) {
+            handle_modal(down, action);
+        } else {
+            switch (g_app.view) {
+            case VIEW_WELCOME: handle_welcome(down, action); break;
+            case VIEW_LOGIN: handle_login(down, action); break;
+            case VIEW_LIBRARY: handle_library(down, repeat, action); break;
+            case VIEW_SETTINGS: handle_settings(down, repeat, action); break;
+            case VIEW_SESSION: handle_session(down, action); break;
+            case VIEW_DETAILS: handle_details(down, repeat, action); break;
+            case VIEW_STREAM: handle_stream(down, held, action, touch_down, touch); break;
+            }
+        }
+        if (hidKeysUp() & KEY_TOUCH) touchpad_end();
+        if (queue_alert_active() && (down || touch_down)) queue_alert_stop();
+        update_pointer_click(down, held);
+
+        /* Game input: touch-held L3/R3/PS, and nothing while menus are up. */
+        const bool streaming = g_app.view == VIEW_STREAM;
+        host_input_set_virtual_buttons(streaming && g_app.touching
+            ? screens_stream_held_buttons(&g_app, touch.px, touch.py) : 0);
+        host_input_set_suppressed(!streaming || g_app.stream_menu || g_app.controls_open || g_app.modal != MODAL_NONE ||
+                                 g_app.lid_paused);
+
+        tick_network();
+        refresh_device_status();
+        log_session();
+
+        /* While queued or setting up, stay awake even with the lid shut so
+         * the queue keeps moving and the alert can fire. Once playing, only
+         * "Sleep" lets the lid sleep the console (and reconnects on waking);
+         * "Pause" and "Keep playing" hold the connection with screens off. */
+        const bool want_sleep = !host_session_active(&g_client) ||
+                                (g_app.stream_started_at && g_app.settings.lid_mode == LID_SLEEP);
+        if (want_sleep != sleep_allowed) {
+            aptSetSleepAllowed(want_sleep);
+            sleep_allowed = want_sleep;
+        }
+
+        g_app.view = derive_view();
+        g_app.keyboard_open = g_transport.keyboard_mode;
+        g_app.status = current_status();
+        g_app.toast = g_notice[0] && osGetTime() < g_notice_until ? g_notice : NULL;
+        track_session();
+        setup_retry_tick();
+        watch_session_errors();
+        launch_track(&g_client);
+        {
+            const u64 last_frame = g_transport.last_decoded_frame_at, at = osGetTime();
+            g_app.video_stalled = g_app.view == VIEW_STREAM && last_frame && at > last_frame &&
+                                  at - last_frame > 1500;
+        }
+        /* While video owns the top screen, redraw the lower screen only when
+         * something on it can have changed. */
+        const u64 now = osGetTime();
+        const bool draw_bottom = g_app.view != VIEW_STREAM || g_app.touching || was_touching ||
+                                 down || now - last_bottom_draw >= 250 ||
+                                 /* Animations on the lower screen run at ~30 fps
+                                  * while streaming (build 69 redrew every loop). */
+                                 (screens_bottom_animating() &&
+                                  (g_app.view != VIEW_STREAM || now - last_bottom_draw >= 33));
+        if (draw_bottom) last_bottom_draw = now;
+        was_touching = g_app.touching;
+        if (g_app.view != VIEW_STREAM) game_art_pump();
+        render(draw_bottom);
+        /* While streaming, don't wait for vblank: sleep inside poll() on the
+         * media socket so a video frame is decoded the moment its packets
+         * land. The 4 ms cap keeps input sampling fast. Build 49 spun on
+         * nonblocking recv every 1 ms instead, and that request flood crashed
+         * the system socket module when video started. */
+        if (g_app.view == VIEW_STREAM) wait_for_media(4);
+    }
+
+    finish_history();
+    if (g_perf.active) perf_end(g_app.settings.install_id);
+    aptUnhook(&g_apt_cookie);
+    queue_alert_exit();
+    /* The media core stops before the sound it feeds is closed. */
+    moon_close(&g_transport);
+    audio_output_close();
+    audio_system_exit();
+    if (host_session_active(&g_client)) {
+        close_media();
+        net_worker_wait_idle(8000);
+        if (net_worker_submit(NET_JOB_STOP_SESSION, NULL, NULL)) net_worker_wait_idle(8000);
+    }
+    /* A session summary still waiting (closing right after playing is
+     * common): one quick try, else it goes out on the next start. */
+    if (g_app.settings.share_stats && report_available() && report_stats_pending()) {
+        net_worker_wait_idle(3000);
+        if (net_worker_submit(NET_JOB_SEND_STATS, NULL, NULL)) net_worker_wait_idle(3000);
+    }
+    aptSetSleepAllowed(true);
+    net_worker_stop();
+    game_art_exit();
+    shutdown_services();
+    ui_exit();
+    gfxExit();
+    return 0;
+}

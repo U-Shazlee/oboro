@@ -1,0 +1,67 @@
+#pragma once
+
+#include <stdbool.h>
+
+#include "app_paths.h"
+#include "host_input.h"
+#include "stream_profile.h"
+
+#define SETTINGS_PATH APP_DATA_DIR "/settings.json"
+
+typedef enum {
+    DEADZONE_SMALL,
+    DEADZONE_MEDIUM,
+    DEADZONE_LARGE,
+    DEADZONE_COUNT
+} DeadzoneLevel;
+
+enum { LID_PAUSE, LID_SLEEP, LID_KEEP_PLAYING, LID_MODE_COUNT };
+/* Automatic diagnostic reports: not asked yet, yes, or no. */
+enum { SHARE_ASK, SHARE_YES, SHARE_NO };
+/* Bumped when what is shared changes, so everyone is asked again:
+ * 2 = problem reports + session performance stats (beta.16). */
+#define SHARE_CONSENT_VERSION 2
+
+typedef struct {
+    HostButtonLayout button_layout;
+    DeadzoneLevel deadzone;
+    bool swap_shoulders;
+    bool show_stats;
+    /* Picture, applied at the next launch. */
+    bool wide_video;
+    StreamBitrateMode bitrate_mode;
+    HostGyroMode gyro_mode;
+    unsigned gyro_speed;
+    /* Appearance and audio. */
+    unsigned theme;
+    /* Stream volume in steps of 20 %: 0 = mute ... 5 = 100 %. */
+    unsigned volume;
+    bool mute_in_menus;
+    /* Closing the lid mid-game (LID_*): pause with the connection kept,
+     * sleep and reconnect on opening, or keep playing with the screens off. */
+    unsigned lid_mode;
+    /* Weak Wi-Fi or a phone hotspot: lower bitrate, bigger buffers. */
+    bool net_weak;
+    /* Send a report automatically when something goes wrong (SHARE_*). */
+    unsigned share_reports;
+    /* Anonymous performance summary after each session. */
+    bool share_stats;
+    /* The SHARE_CONSENT_VERSION last answered (0 = never asked). */
+    unsigned share_consent;
+    /* Random, made on this console: tells reports from one console apart. */
+    char install_id[20];
+    /* The first-run guide was finished or skipped. */
+    bool guide_done;
+    /* Look for updates once or twice a day; include pre-releases (beta). */
+    bool auto_update;
+    bool update_beta;
+} AppSettings;
+
+void settings_defaults(AppSettings *settings);
+bool settings_load(AppSettings *settings);
+bool settings_save(const AppSettings *settings);
+/* Push controller-related settings into the input encoder. */
+void settings_apply_input(const AppSettings *settings);
+/* Push the picture settings into the stream profile. */
+void settings_apply_picture(const AppSettings *settings);
+unsigned settings_deadzone_percent(DeadzoneLevel level);

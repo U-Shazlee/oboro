@@ -1,0 +1,2267 @@
+#include "app.h"
+#include "app_paths.h"
+
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#include "game_art.h"
+#include "game_prefs.h"
+#include "updater.h"
+#include "mvd_video.h"
+#include "play_history.h"
+#include "zoom_zones.h"
+#include "remote_keyboard.h"
+#include "stream_profile.h"
+#include "pc_stats.h"
+#include "report.h"
+
+/* ---- Shared geometry (drawing and hit-testing use the same rects) -------- */
+
+/* Library, lower screen: a roomy layout, and a compact one that makes space
+ * for the "Continue" bar when a game was played before. */
+typedef struct { UiRect prev, next, card, cont, play, library, search, settings; } LibraryLayout;
+static const LibraryLayout LIB_ROOMY = {
+    { 8, 34, 30, 84 }, { 282, 34, 30, 84 }, { 44, 34, 232, 84 }, { 0, 0, 0, 0 },
+    { 16, 128, 288, 46 }, { 16, 184, 90, 48 }, { 115, 184, 90, 48 }, { 214, 184, 90, 48 },
+};
+static const LibraryLayout LIB_COMPACT = {
+    { 8, 30, 30, 72 }, { 282, 30, 30, 72 }, { 44, 30, 232, 72 }, { 16, 108, 288, 30 },
+    { 16, 144, 288, 40 }, { 16, 190, 90, 44 }, { 115, 190, 90, 44 }, { 214, 190, 90, 44 },
+};
+
+static const LibraryLayout *library_layout(const App *app)
+{
+    return app->continue_index >= 0 && !app->search_text[0] ? &LIB_COMPACT : &LIB_ROOMY;
+}
+
+/* Welcome. */
+static const UiRect WEL_SIGN_IN = { 40, 100, 240, 50 };
+static const UiRect WEL_SETTINGS = { 40, 160, 116, 42 };
+static const UiRect WEL_EXIT = { 164, 160, 116, 42 };
+
+/* Login and session: two mirrored buttons, or one centred. */
+static const UiRect PAIR_LEFT = { 16, 186, 140, 44 };
+static const UiRect PAIR_RIGHT = { 164, 186, 140, 44 };
+static const UiRect SINGLE = { 60, 186, 200, 44 };
+
+/* Settings. */
+static const UiRect SET_PREV = { 16, 188, 60, 44 };
+static const UiRect SET_BACK = { 84, 188, 152, 44 };
+static const UiRect SET_NEXT = { 244, 188, 60, 44 };
+
+/* Stream. */
+static const UiRect STR_L3 = { 6, 30, 56, 156 };
+static const UiRect STR_R3 = { 258, 30, 56, 156 };
+static const UiRect STR_PANEL = { 68, 30, 184, 112 };
+static const UiRect STR_GUIDE = { 132, 146, 56, 42 };
+#define STR_BUTTON_Y 194.0f
+#define STR_BUTTON_H 40.0f
+
+/* Modal and stream menu. */
+static const UiRect MODAL_LEFT = { 40, 132, 116, 46 };
+static const UiRect MODAL_RIGHT = { 164, 132, 116, 46 };
+static const UiRect MENU_PANEL = { 12, 6, 296, 228 };
+
+/* Game details, lower screen. */
+static const UiRect DET_PLAY = { 16, 34, 288, 58 };
+static const UiRect DET_STORE_PREV = { 16, 106, 44, 44 };
+static const UiRect DET_STORE_NEXT = { 260, 106, 44, 44 };
+static const UiRect DET_FAV = { 16, 188, 92, 44 };
+static const UiRect DET_OPTIONS = { 114, 188, 92, 44 };
+static const UiRect DET_BACK = { 212, 188, 92, 44 };
+static const UiRect OPT_CLOSE = { 84, 206, 152, 30 };
+#define OPT_ROW_Y 38.0f
+#define OPT_ROW_H 30.0f
+
+/* Button mapping editor, lower screen. */
+static const UiRect MAP_PREV = { 16, 96, 48, 48 };
+static const UiRect MAP_NEXT = { 256, 96, 48, 48 };
+static const UiRect MAP_RESET = { 16, 196, 92, 38 };
+static const UiRect MAP_CANCEL = { 114, 196, 92, 38 };
+static const UiRect MAP_DONE = { 212, 196, 92, 38 };
+
+/* Guide, lower screen. */
+static const UiRect GUIDE_BACK = { 16, 188, 92, 44 };
+static const UiRect GUIDE_SKIP = { 114, 188, 92, 44 };
+static const UiRect GUIDE_NEXT = { 212, 188, 92, 44 };
+
+/* Software update and what's new, lower screen. */
+static const UiRect UPD_PRIMARY = { 16, 148, 288, 44 };
+static const UiRect UPD_LATER = { 16, 200, 140, 34 };
+static const UiRect UPD_CLOSE = { 164, 200, 140, 34 };
+static const UiRect NEW_CONTINUE = { 60, 184, 200, 44 };
+
+/* Which options row a tap landed on (read by main with the action). */
+static int g_touched_option_row = -1;
+int screens_touched_option_row(void) { return g_touched_option_row; }
+
+/* Top screen list viewport shared by the library and settings. */
+#define LIST_TOP 60.0f
+#define LIST_BOTTOM 214.0f
+
+static UiRect stream_button(int index)
+{
+    const float margin = 6.0f, gap = 6.0f;
+    const float w = (UI_BOTTOM_WIDTH - 2 * margin - 3 * gap) / 4.0f;
+    return (UiRect){ margin + index * (w + gap), STR_BUTTON_Y, w, STR_BUTTON_H };
+}
+
+static UiRect menu_item(int index)
+{
+    const float w = (MENU_PANEL.w - 32 - 8) / 2;
+    return (UiRect){ MENU_PANEL.x + 16 + (index % 2) * (w + 8),
+                     MENU_PANEL.y + 42 + (index / 2) * 45.0f, w, 38 };
+}
+
+UiRect screens_stream_panel(void) { return STR_PANEL; }
+
+static bool pressed(const App *app, UiRect r)
+{
+    return app->touching && ui_hit(r, app->touch_x, app->touch_y);
+}
+
+/* ---- Animation state ------------------------------------------------------ */
+
+/* Each screen fades and rises in when its view changes; the modal and the
+ * stream menu fade in over it. Timestamps are per screen because the lower
+ * screen is redrawn less often while streaming. */
+typedef struct {
+    int view;
+    u64 since;
+    int overlay;
+    u64 overlay_since;
+} ScreenAnim;
+
+static ScreenAnim g_top_anim = { -1, 0, 0, 0 }, g_bottom_anim = { -1, 0, 0, 0 };
+static bool g_bottom_busy_animating;
+
+#define VIEW_FADE_MS 220.0f
+#define OVERLAY_FADE_MS 160.0f
+
+static float view_progress(ScreenAnim *anim, int view, int overlay)
+{
+    const u64 now = osGetTime();
+    if (anim->view != view) {
+        anim->view = view;
+        anim->since = now;
+    }
+    if (anim->overlay != overlay) {
+        anim->overlay = overlay;
+        anim->overlay_since = now;
+    }
+    return ui_ease_out(ui_progress(anim->since, VIEW_FADE_MS));
+}
+
+static float overlay_progress(const ScreenAnim *anim)
+{
+    return ui_ease_out(ui_progress(anim->overlay_since, OVERLAY_FADE_MS));
+}
+
+bool screens_bottom_animating(void) { return g_bottom_busy_animating; }
+
+/* A black veil over everything below the status bar, lifted as p -> 1. */
+static void fade_in_veil(float width, float top, float p)
+{
+    if (p >= 1.0f) return;
+    ui_rect(0, top, width, UI_HEIGHT - top, ui_with_alpha(UI_BG, (u8)(255.0f * (1.0f - p))));
+}
+
+/* ---- Settings model ------------------------------------------------------ */
+
+/* The settings list is grouped: each entry is a section heading (setting
+ * -1) or a setting. Navigation walks settings only. */
+typedef struct {
+    int setting;
+    const char *jp;
+    const char *en;
+} SettingEntry;
+
+static const SettingEntry SETTING_ENTRIES[] = {
+    { -1, "操作", "CONTROLS" },
+    { SETTING_LAYOUT, NULL, NULL },
+    { SETTING_TRIGGERS, NULL, NULL },
+    { SETTING_DEADZONE, NULL, NULL },
+    { SETTING_GYRO, NULL, NULL },
+    { SETTING_GYRO_SPEED, NULL, NULL },
+    { -1, "画質", "PICTURE" },
+    { SETTING_RESOLUTION, NULL, NULL },
+    { SETTING_BITRATE, NULL, NULL },
+    { SETTING_STATS, NULL, NULL },
+    { -1, "音声", "AUDIO" },
+    { SETTING_VOLUME, NULL, NULL },
+    { SETTING_MENU_AUDIO, NULL, NULL },
+    { -1, "外観", "APPEARANCE" },
+    { SETTING_THEME, NULL, NULL },
+    { -1, "接続", "NETWORK" },
+    { SETTING_NETWORK, NULL, NULL },
+    { -1, "本体", "SYSTEM" },
+    { SETTING_LID, NULL, NULL },
+    { SETTING_GUIDE, NULL, NULL },
+    { -1, "更新", "UPDATES" },
+    { SETTING_UPDATES, NULL, NULL },
+    { SETTING_AUTO_UPDATE, NULL, NULL },
+    { SETTING_UPDATE_CHANNEL, NULL, NULL },
+    { -1, "パソコン", "YOUR PC" },
+    { SETTING_ACCOUNT, NULL, NULL },
+};
+#define SETTING_ENTRY_COUNT (int)(sizeof(SETTING_ENTRIES) / sizeof(SETTING_ENTRIES[0]))
+
+int screens_setting_at(int position)
+{
+    int seen = 0;
+    for (int i = 0; i < SETTING_ENTRY_COUNT; ++i) {
+        if (SETTING_ENTRIES[i].setting < 0) continue;
+        if (seen++ == position) return SETTING_ENTRIES[i].setting;
+    }
+    return SETTING_ACCOUNT;
+}
+
+static const char *const SETTING_LABELS[SETTING_COUNT] = {
+    [SETTING_LAYOUT] = "Button layout", [SETTING_TRIGGERS] = "Triggers",
+    [SETTING_DEADZONE] = "Stick deadzone", [SETTING_STATS] = "Stream stats",
+    [SETTING_RESOLUTION] = "Screen mode", [SETTING_BITRATE] = "Bitrate",
+    [SETTING_GYRO] = "Gyro aim", [SETTING_GYRO_SPEED] = "Gyro speed",
+    [SETTING_ACCOUNT] = "Paired PC",
+    [SETTING_THEME] = "Theme", [SETTING_VOLUME] = "Stream volume",
+    [SETTING_MENU_AUDIO] = "Audio in menus", [SETTING_LID] = "Closing the lid",
+    [SETTING_GUIDE] = "Getting started", [SETTING_NETWORK] = "Connection type",
+    [SETTING_UPDATES] = "Software update", [SETTING_AUTO_UPDATE] = "Check automatically",
+    [SETTING_UPDATE_CHANNEL] = "Update channel",
+};
+static const char *const SETTING_JP[SETTING_COUNT] = {
+    [SETTING_LAYOUT] = "ボタン配置", [SETTING_TRIGGERS] = "トリガー",
+    [SETTING_DEADZONE] = "デッドゾーン", [SETTING_STATS] = "統計",
+    [SETTING_RESOLUTION] = "表示", [SETTING_BITRATE] = "ビットレート",
+    [SETTING_GYRO] = "ジャイロ", [SETTING_GYRO_SPEED] = "感度",
+    [SETTING_ACCOUNT] = "パソコン",
+    [SETTING_THEME] = "色", [SETTING_VOLUME] = "音量",
+    [SETTING_MENU_AUDIO] = "メニュー音", [SETTING_LID] = "スリープ",
+    [SETTING_GUIDE] = "案内", [SETTING_NETWORK] = "回線",
+    [SETTING_UPDATES] = "更新", [SETTING_AUTO_UPDATE] = "自動確認",
+    [SETTING_UPDATE_CHANNEL] = "チャンネル",
+};
+
+/* Where an app comes from: the paired PC. */
+static const char *store_label(const char *code)
+{
+    return code && code[0] ? code : "PC";
+}
+
+static const char *gyro_mode_name(HostGyroMode mode)
+{
+    return mode == HOST_GYRO_ALWAYS ? "Always" : mode == HOST_GYRO_WHILE_AIMING ? "While aiming" : "Off";
+}
+
+/* Current option and option count, for the dot indicator. */
+static unsigned setting_option(const App *app, int setting, unsigned *count)
+{
+    const AppSettings *s = &app->settings;
+    switch (setting) {
+    case SETTING_LAYOUT: *count = 2; return s->button_layout == HOST_LAYOUT_POSITION ? 0 : 1;
+    case SETTING_TRIGGERS: *count = 2; return s->swap_shoulders ? 1 : 0;
+    case SETTING_DEADZONE: *count = DEADZONE_COUNT; return (unsigned)s->deadzone;
+    case SETTING_STATS: *count = 2; return s->show_stats ? 0 : 1;
+    case SETTING_RESOLUTION: *count = 2; return s->wide_video ? 0 : 1;
+    case SETTING_BITRATE: *count = STREAM_BITRATE_COUNT; return (unsigned)s->bitrate_mode;
+    case SETTING_GYRO: *count = HOST_GYRO_MODE_COUNT; return (unsigned)s->gyro_mode;
+    case SETTING_GYRO_SPEED: *count = 3; return s->gyro_speed;
+    case SETTING_THEME: *count = UI_THEME_COUNT; return s->theme;
+    case SETTING_VOLUME: *count = 6; return s->volume;
+    case SETTING_MENU_AUDIO: *count = 2; return s->mute_in_menus ? 1 : 0;
+    case SETTING_LID: *count = LID_MODE_COUNT; return s->lid_mode;
+    case SETTING_NETWORK: *count = 2; return s->net_weak ? 1 : 0;
+    case SETTING_AUTO_UPDATE: *count = 2; return s->auto_update ? 0 : 1;
+    case SETTING_UPDATE_CHANNEL: *count = 2; return s->update_beta ? 1 : 0;
+    default: *count = 0; return 0;
+    }
+}
+
+static const char *setting_value(const App *app, int setting)
+{
+    const AppSettings *s = &app->settings;
+    switch (setting) {
+    case SETTING_LAYOUT: return s->button_layout == HOST_LAYOUT_POSITION ? "Position" : "Letters";
+    case SETTING_TRIGGERS: return s->swap_shoulders ? "L / R" : "ZL / ZR";
+    case SETTING_DEADZONE:
+        return s->deadzone == DEADZONE_SMALL ? "Small" : s->deadzone == DEADZONE_LARGE ? "Large" : "Medium";
+    case SETTING_STATS: return s->show_stats ? "On" : "Off";
+    case SETTING_RESOLUTION: return s->wide_video ? "Wide 800" : "Classic 400";
+    case SETTING_BITRATE: {
+        static const char *const names[STREAM_BITRATE_COUNT] = {
+            "Balanced", "Steady 1 Mbps", "Steady 1.2 Mbps", "Steady 1.5 Mbps", "Sharp"
+        };
+        return names[s->bitrate_mode];
+    }
+    case SETTING_GYRO: return gyro_mode_name(s->gyro_mode);
+    case SETTING_GYRO_SPEED: return s->gyro_speed == 0 ? "Low" : s->gyro_speed == 2 ? "High" : "Medium";
+    case SETTING_THEME: return ui_theme_name((UiTheme)s->theme);
+    case SETTING_VOLUME: {
+        static const char *const levels[6] = { "Muted", "20 %", "40 %", "60 %", "80 %", "100 %" };
+        return levels[s->volume < 6 ? s->volume : 5];
+    }
+    case SETTING_MENU_AUDIO: return s->mute_in_menus ? "Muted" : "Keep playing";
+    case SETTING_LID: return s->lid_mode == LID_KEEP_PLAYING ? "Keep playing" :
+                             s->lid_mode == LID_SLEEP ? "Sleep" : "Pause";
+    case SETTING_NETWORK: return s->net_weak ? "Weak / hotspot" : "Standard";
+    case SETTING_GUIDE: return "Open";
+    case SETTING_UPDATES: {
+        static char text[48];
+        const UpdateInfo info = updater_info();
+        if (info.state == UPDATE_AVAILABLE) snprintf(text, sizeof(text), "%s ready", info.latest);
+        else if (info.state == UPDATE_UP_TO_DATE) snprintf(text, sizeof(text), "Up to date");
+        else if (info.state == UPDATE_INSTALLED) snprintf(text, sizeof(text), "Restart to finish");
+        else snprintf(text, sizeof(text), "v%s", APP_VERSION);
+        return text;
+    }
+    case SETTING_AUTO_UPDATE: return s->auto_update ? "On" : "Off";
+    case SETTING_UPDATE_CHANNEL: return s->update_beta ? "Beta" : "Stable";
+    case SETTING_ACCOUNT: return host_has_session(app->client) ? app->client->address : "Not paired";
+    }
+    return "";
+}
+
+static const char *setting_description(const App *app, int setting)
+{
+    const AppSettings *s = &app->settings;
+    switch (setting) {
+    case SETTING_LAYOUT:
+        return s->button_layout == HOST_LAYOUT_POSITION
+            ? "Buttons match their place on the pad: bottom is Cross, right is Circle. Plays like a PlayStation controller."
+            : "The printed letters match: 3DS A sends A. Cross and Circle end up swapped compared with a PlayStation pad.";
+    case SETTING_TRIGGERS:
+        return s->swap_shoulders
+            ? "The big L and R buttons act as the L2 / R2 triggers; ZL and ZR become L1 / R1."
+            : "ZL and ZR are the L2 / R2 triggers; L and R are the L1 / R1 bumpers.";
+    case SETTING_DEADZONE:
+        return "How far a stick moves before the game notices. Raise it if a character drifts on its own.";
+    case SETTING_STATS:
+        return "Frame rate, bitrate and ping, your PC's CPU and GPU load, and this console's battery and Wi-Fi on the lower screen. Tap the tiles to turn the page.";
+    case SETTING_RESOLUTION:
+        return s->wide_video
+            ? "Uses the top screen's 800-pixel mode: twice the detail across, sharper text."
+            : "The normal 400-column top screen. Use only if Wide misbehaves.";
+    case SETTING_BITRATE:
+        return s->bitrate_mode == STREAM_BITRATE_ADAPTIVE
+            ? "About 1.4 Mbps: a clean, detailed picture on good home Wi-Fi. The default. Next launch."
+            : s->bitrate_mode == STREAM_BITRATE_SHARP_TEST
+            ? "About 2 Mbps: the sharpest picture. Needs strong Wi-Fi (3 bars, near the router). Next launch."
+            : s->bitrate_mode == STREAM_BITRATE_STEADY_1000
+            ? "About 1 Mbps: smoothest on weak Wi-Fi, a little softer. Next launch."
+            : "A middle rate. If the picture stutters, pick a lower one. Next launch.";
+    case SETTING_GYRO:
+        return s->gyro_mode == HOST_GYRO_OFF
+            ? "Tilt and turn the console to aim, like a Switch or Steam Deck. Adds to the C-Stick; moves the pointer in pointer mode."
+            : s->gyro_mode == HOST_GYRO_ALWAYS
+            ? "Turning the console always moves the camera. Great for shooters; hold the console still when you don't aim."
+            : "Gyro only works while the aim trigger (ZL, or L when triggers are swapped) is held.";
+    case SETTING_GYRO_SPEED:
+        return "How fast turning the console moves the camera. Start at Medium and lower it if aiming overshoots.";
+    case SETTING_THEME:
+        return "The accent colour: Seiji celadon, Sakura cherry, Kin gold, Ai indigo or Fuji wisteria.";
+    case SETTING_VOLUME:
+        return "Game audio volume on this console, on top of the 3DS volume slider.";
+    case SETTING_MENU_AUDIO:
+        return s->mute_in_menus
+            ? "Game audio goes quiet while the stream menu or controls sheet is open."
+            : "Game audio keeps playing while the stream menu is open.";
+    case SETTING_NETWORK:
+        return s->net_weak
+            ? "For far-away Wi-Fi or a phone hotspot: a steadier 0.6-1 Mbps picture, a longer wait for lost packets and a bigger buffer. Softer image, a little more delay. Next launch."
+            : "For home Wi-Fi near the router: the sharpest picture and lowest delay. Next launch.";
+    case SETTING_GUIDE: return "Walk through the basics again: pairing your PC, controls, picture and extras.";
+    case SETTING_UPDATES:
+        return "See what's new and install the latest version from GitHub. Your pairing, library and settings stay.";
+    case SETTING_AUTO_UPDATE:
+        return s->auto_update ? "Oboro looks for a new version every few hours, only in the menus, never while you play."
+                              : "Oboro only looks for updates when you open Software update.";
+    case SETTING_UPDATE_CHANNEL:
+        return s->update_beta ? "Beta: get test versions first. They may have rough edges."
+                              : "Stable: only finished releases.";
+    case SETTING_LID:
+        return s->lid_mode == LID_KEEP_PLAYING
+            ? "Closing the lid turns the screens off; the game and its sound keep running."
+            : s->lid_mode == LID_SLEEP
+            ? "Closing the lid sleeps the console to save battery. On opening it, the stream reconnects to your PC."
+            : "Closing the lid turns the screens and sound off but stays connected: open it and you are straight back in.";
+    case SETTING_ACCOUNT:
+        return "Forget this PC: removes the pairing and its saved app list from this console. Then pair again, with this PC or another.";
+    }
+    return "";
+}
+
+void screens_setting_change(App *app, int setting, int direction)
+{
+    AppSettings *s = &app->settings;
+    const int step = direction < 0 ? -1 : 1;
+    switch (setting) {
+    case SETTING_LAYOUT:
+        s->button_layout = s->button_layout == HOST_LAYOUT_POSITION ? HOST_LAYOUT_LABEL
+                                                                   : HOST_LAYOUT_POSITION;
+        break;
+    case SETTING_TRIGGERS: s->swap_shoulders = !s->swap_shoulders; break;
+    case SETTING_DEADZONE:
+        s->deadzone = (DeadzoneLevel)((s->deadzone + DEADZONE_COUNT + step) % DEADZONE_COUNT);
+        break;
+    case SETTING_STATS: s->show_stats = !s->show_stats; break;
+    case SETTING_RESOLUTION: s->wide_video = !s->wide_video; break;
+    case SETTING_GYRO:
+        s->gyro_mode = (HostGyroMode)((s->gyro_mode + HOST_GYRO_MODE_COUNT + step) % HOST_GYRO_MODE_COUNT);
+        break;
+    case SETTING_GYRO_SPEED: s->gyro_speed = (s->gyro_speed + 3 + step) % 3; break;
+    case SETTING_THEME: s->theme = (s->theme + UI_THEME_COUNT + step) % UI_THEME_COUNT; break;
+    case SETTING_VOLUME: s->volume = (s->volume + 6 + step) % 6; break;
+    case SETTING_MENU_AUDIO: s->mute_in_menus = !s->mute_in_menus; break;
+    case SETTING_LID: s->lid_mode = (s->lid_mode + LID_MODE_COUNT + step) % LID_MODE_COUNT; break;
+    case SETTING_NETWORK: s->net_weak = !s->net_weak; break;
+    case SETTING_AUTO_UPDATE: s->auto_update = !s->auto_update; break;
+    case SETTING_UPDATE_CHANNEL: s->update_beta = !s->update_beta; break;
+    case SETTING_BITRATE:
+        s->bitrate_mode = (StreamBitrateMode)((s->bitrate_mode + STREAM_BITRATE_COUNT + step) %
+                                              STREAM_BITRATE_COUNT);
+        break;
+    default: break;
+    }
+}
+
+/* ---- Common chrome ------------------------------------------------------- */
+
+static void draw_status_bar(const App *app, float width)
+{
+    ui_wifi_icon(12.0f, 7.0f, app->wifi_bars, UI_TEXT, UI_LINE_STRONG);
+    ui_battery_icon(36.0f, 7.0f, app->battery_level, app->charging);
+
+    char clock[8] = "--:--";
+    const time_t now = time(NULL);
+    const struct tm *local = gmtime(&now);
+    if (local) strftime(clock, sizeof(clock), "%H:%M", local);
+    const float clock_w = ui_text(width - 12.0f, 5.0f, 12.0f, UI_TEXT, UI_ALIGN_RIGHT, clock);
+    /* A quiet badge while a newer version waits (until dismissed). */
+    if (app->view != VIEW_STREAM && updater_info().state == UPDATE_AVAILABLE && !updater_dismissed())
+        ui_pill(width - 20.0f - clock_w, 4.0f, UI_ACCENT, UI_ALIGN_RIGHT, "UPDATE");
+
+    /* Seal and wordmark centred as one group. */
+    const float name_w = ui_text_width(APP_NAME, 12.0f);
+    const float group_x = width / 2 - (16.0f + 6.0f + name_w) / 2;
+    ui_seal(group_x, 4.0f, 16.0f);
+    ui_text(group_x + 22.0f, 5.0f, 12.0f, UI_TEXT, UI_ALIGN_LEFT, APP_NAME);
+
+    ui_hline(0, 25.0f, width, UI_LINE);
+    ui_rect(width / 2 - 14.0f, 25.0f, 28.0f, 1.0f, UI_ACCENT);
+}
+
+static void draw_title(float center, float y, const char *jp, const char *en)
+{
+    if (ui_has_japanese()) {
+        ui_text(center, y - 2.0f, 12.0f, UI_ACCENT, UI_ALIGN_CENTER, jp);
+        ui_label(center, y + 12.0f, 11.0f, UI_TEXT, UI_ALIGN_CENTER, en);
+    } else {
+        ui_label(center, y + 6.0f, 12.0f, UI_TEXT, UI_ALIGN_CENTER, en);
+    }
+}
+
+static void draw_footer(float width, const char *const *hints)
+{
+    ui_hline(16.0f, 218.0f, width - 32.0f, UI_LINE);
+    ui_hint_row(width / 2, 223.0f, hints);
+}
+
+static void draw_status_strip(const App *app, const char *text)
+{
+    const bool signed_in = host_has_session(app->client);
+    const bool toast = app->toast != NULL;
+    if (toast) ui_rect(0, 0, UI_BOTTOM_WIDTH, 23, UI_ACCENT_DEEP);
+    ui_circle(14.0f, 11.0f, 3.0f, signed_in ? UI_ACCENT : UI_TEXT_FAINT);
+    ui_text_fit(UI_BOTTOM_WIDTH / 2, 5.0f, 11.0f, toast ? UI_TEXT : UI_TEXT_DIM, UI_ALIGN_CENTER,
+                260.0f, toast ? app->toast : text);
+    ui_circle(UI_BOTTOM_WIDTH - 14.0f, 11.0f, 3.0f, signed_in ? UI_ACCENT : UI_TEXT_FAINT);
+    ui_hline(0, 23.0f, UI_BOTTOM_WIDTH, toast ? UI_ACCENT : UI_LINE);
+}
+
+static void draw_arrow(UiRect r, int direction, bool enabled, bool is_pressed)
+{
+    ui_rect_r(r, is_pressed ? UI_RAISED : UI_BG);
+    ui_outline(r.x, r.y, r.w, r.h, 1.0f, enabled ? UI_LINE_STRONG : UI_LINE);
+    const float cx = r.x + r.w / 2 + (is_pressed ? (float)direction : 0.0f), cy = r.y + r.h / 2;
+    const u32 color = enabled ? UI_TEXT : UI_LINE_STRONG;
+    if (direction < 0) ui_triangle(cx + 4, cy - 7, cx + 4, cy + 7, cx - 5, cy, color);
+    else ui_triangle(cx - 4, cy - 7, cx - 4, cy + 7, cx + 5, cy, color);
+}
+
+/* Floating overlays share one card style: scrim, surface, accent rule. */
+static void draw_card(UiRect r, float p)
+{
+    ui_rect_r(r, UI_SURFACE);
+    ui_outline(r.x, r.y, r.w, r.h, 1.0f, UI_LINE_STRONG);
+    ui_rect(r.x, r.y, r.w * p, 2, UI_ACCENT);
+}
+
+static void draw_busy_top(const App *app)
+{
+    ui_rect(0, 26, UI_TOP_WIDTH, 214, UI_SCRIM);
+    const UiRect card = { 80, 80, 240, 96 };
+    draw_card(card, 1.0f);
+    ui_enso(200, 114, 16, UI_ACCENT);
+    ui_text_wrap(200, 140, 12, UI_TEXT, UI_ALIGN_CENTER, 220, 2, 15, app->busy);
+}
+
+/* ---- Top screens --------------------------------------------------------- */
+
+/* Mist that sways slowly sideways; oversized so its faded edges stay off-screen. */
+static void draw_mist(float y, float alpha)
+{
+    const float sway = sinf((float)ui_ticks() / 9000.0f * 2.0f * (float)M_PI) * 18.0f;
+    ui_image(UI_IMAGE_MIST, -26.0f + sway, y, 1.13f, alpha);
+}
+
+static void draw_welcome_backdrop(void)
+{
+    if (!ui_image(UI_IMAGE_HERO, 0, 0, 1.0f, 1.0f)) {
+        ui_seigaiha(0, 168, UI_TOP_WIDTH, 80, 22, C2D_Color32(0x1C, 0x1C, 0x22, 0xFF), UI_BG);
+        C2D_DrawRectangle(0, 160, 0, UI_TOP_WIDTH, 60, UI_BG, UI_BG,
+                          ui_with_alpha(UI_BG, 0), ui_with_alpha(UI_BG, 0));
+    }
+    draw_mist(118, 0.55f);
+}
+
+static void draw_welcome_top(void)
+{
+    /* The hero art leaves the upper centre empty for the mark. A slow
+     * breath on the seal keeps the screen alive without distracting. */
+    const float breath = 0.5f + 0.5f * sinf((float)ui_ticks() / 2600.0f * 2.0f * (float)M_PI);
+    ui_circle(200, 54, 26 + breath * 2.0f, ui_with_alpha(UI_ACCENT, (u8)(18 + breath * 14)));
+    ui_seal(180, 34, 40);
+    ui_text(200, 80, 26, UI_TEXT, UI_ALIGN_CENTER, APP_NAME);
+    ui_text(200, 109, 12, UI_ACCENT, UI_ALIGN_CENTER, "リモートプレイ");
+    ui_label(200, 125, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, "YOUR PC  ·  NEW 3DS");
+    static const char *const hints[] = { "A", "Connect", "SELECT", "Settings", "START", "Exit", NULL };
+    ui_rect(0, 216, UI_TOP_WIDTH, 24, ui_with_alpha(UI_BG, 0xB0));
+    ui_hint_row(200, 221, hints);
+}
+
+static void draw_login_top(const App *app)
+{
+    const HostClient *client = app->client;
+    draw_title(200, 34, "ペアリング", "PAIR WITH YOUR PC");
+    ui_text(200, 68, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, "On your PC, open Sunshine's PIN page:");
+    ui_text_fit(200, 83, 14, UI_TEXT, UI_ALIGN_CENTER, 368, client->verification_uri);
+
+    /* One cell per character of the code; the cells drop in one by one. */
+    const size_t length = strlen(client->user_code);
+    const float cell = 26.0f, gap = 5.0f;
+    float total = 0;
+    for (size_t i = 0; i < length; ++i)
+        total += (client->user_code[i] == '-' ? 10.0f : cell) + (i + 1 < length ? gap : 0);
+    float x = 200 - total / 2;
+    for (size_t i = 0; i < length; ++i) {
+        char glyph[2] = { client->user_code[i], 0 };
+        if (glyph[0] == '-') {
+            ui_rect(x + 2, 128, 6, 2, UI_TEXT_FAINT);
+            x += 10.0f + gap;
+            continue;
+        }
+        ui_rect(x, 108, cell, 38, UI_SURFACE);
+        ui_outline(x, 108, cell, 38, 1.0f, UI_LINE_STRONG);
+        ui_rect(x, 144, cell, 2, UI_ACCENT);
+        ui_text(x + cell / 2, 114, 22, UI_TEXT, UI_ALIGN_CENTER, glyph);
+        x += cell + gap;
+    }
+
+    const char *waiting = "Waiting for the PIN on your PC";
+    const float w = ui_text_width(waiting, 11);
+    ui_enso(200 - w / 2 - 12, 172, 6, UI_ACCENT);
+    ui_text(200 - w / 2 + 2, 166, 11, UI_TEXT_DIM, UI_ALIGN_LEFT, waiting);
+    const long remaining = (long)(client->challenge_expires_at - (int64_t)time(NULL));
+    if (remaining > 0)
+        ui_textf(200, 186, 11, remaining < 60 ? UI_KIN : UI_TEXT_FAINT, UI_ALIGN_CENTER,
+                 "PIN expires in %ld:%02ld", remaining / 60, remaining % 60);
+    static const char *const hints[] = { "Y", "New PIN", "B", "Cancel", NULL };
+    draw_footer(UI_TOP_WIDTH, hints);
+}
+
+/* Smoothly gliding selection bar shared by the library and settings. */
+static void draw_selection(float y, float h, float alpha)
+{
+    ui_rect(14, y, 372, h, ui_with_alpha(UI_RAISED, (u8)(255 * alpha)));
+    ui_rect(14, y, 2, h, ui_with_alpha(UI_ACCENT, (u8)(255 * alpha)));
+}
+
+/* The list leaves room on the right for the selected game's box art. */
+#define LIB_LIST_W 266.0f
+#define LIB_ART_X 290.0f
+#define LIB_ART_Y 64.0f
+
+/* A placeholder card: the title's first letter on the seigaiha texture. */
+static void draw_art_placeholder(const HostGame *game, float x, float y, float w, float h)
+{
+    ui_rect(x, y, w, h, UI_SURFACE);
+    ui_outline(x, y, w, h, 1.0f, UI_LINE);
+    char initial[2] = { game && game->title[0] ? game->title[0] : '?', 0 };
+    if (initial[0] >= 'a' && initial[0] <= 'z') initial[0] = (char)(initial[0] - 32);
+    ui_text(x + w / 2, y + h / 2 - (h > 80 ? 18 : 10), h > 80 ? 32 : 18, UI_LINE_STRONG,
+            UI_ALIGN_CENTER, initial);
+}
+
+/* Draws a game's art (or its placeholder) fitted to w x h at (x, y). */
+static void draw_game_art(const HostGame *game, float x, float y, float w, float alpha)
+{
+    const float scale = w / GAME_ART_WIDTH, h = GAME_ART_HEIGHT * scale;
+    game_art_want(game);
+    if (!game_art_draw(game, x, y, scale, alpha)) draw_art_placeholder(game, x, y, w, h);
+    ui_outline(x - 1, y - 1, w + 2, h + 2, 1.0f, UI_LINE_STRONG);
+}
+
+static void draw_library_art(const App *app)
+{
+    /* Cross-fade when the selection changes. */
+    static const HostGame *shown;
+    static u64 changed_at;
+    const HostGame *game = app_game(app, app->selected);
+    if (!game) return;
+    if (game != shown) {
+        shown = game;
+        changed_at = osGetTime();
+    }
+    const float t = ui_ease_out(ui_progress(changed_at, 200.0f));
+    ui_rect(LIB_ART_X - 6, LIB_ART_Y - 4, GAME_ART_WIDTH + 12, GAME_ART_HEIGHT + 30,
+            UI_SURFACE);
+    draw_game_art(game, LIB_ART_X, LIB_ART_Y + (1.0f - t) * 4.0f, GAME_ART_WIDTH, 0.35f + 0.65f * t);
+    ui_rect(LIB_ART_X + GAME_ART_WIDTH / 2 - 12, LIB_ART_Y + GAME_ART_HEIGHT + 6, 24, 1, UI_ACCENT);
+    ui_text_fit(LIB_ART_X + GAME_ART_WIDTH / 2, LIB_ART_Y + GAME_ART_HEIGHT + 11, 11, UI_TEXT_DIM,
+                UI_ALIGN_CENTER, GAME_ART_WIDTH + 8, store_label(game->store));
+    /* Warm the neighbours so scrolling feels instant. */
+    if (app->selected > 0) game_art_want(app_game(app, app->selected - 1));
+    if (app->selected + 1 < app->list_count) game_art_want(app_game(app, app->selected + 1));
+}
+
+/* ALL / FAV / RECENT, switched with L and R. */
+static void draw_library_tabs(const App *app)
+{
+    static const char *const names[LIBRARY_TAB_COUNT] = { "ALL", "FAV", "RECENT" };
+    float x = 18;
+    for (int i = 0; i < LIBRARY_TAB_COUNT; ++i) {
+        const bool on = i == app->library_tab;
+        ui_label(x, 40, 11, on ? UI_ACCENT : UI_TEXT_FAINT, UI_ALIGN_LEFT, names[i]);
+        const float w = ui_text_width(names[i], 11) + 4;
+        if (on) ui_rect(x, 53, w, 2, UI_ACCENT);
+        x += w + 12;
+    }
+}
+
+static void draw_library_top(const App *app, bool entering)
+{
+    static float bar_y;
+    const bool searching = app->search_text[0] != '\0';
+    const size_t count = app->list_count;
+    draw_title(200, 31, searching ? "検索" : "ライブラリ", searching ? "SEARCH" : "LIBRARY");
+    if (searching) {
+        char query[96];
+        snprintf(query, sizeof(query), "\"%s\"", app->search_text);
+        ui_text_fit(18, 40, 11, UI_TEXT_DIM, UI_ALIGN_LEFT, 120, query);
+    } else if (app->client->game_count) {
+        draw_library_tabs(app);
+    } else {
+        ui_label(18, 41, 11, UI_TEXT_FAINT, UI_ALIGN_LEFT, "YOUR GAMES");
+    }
+    if (count)
+        ui_textf(382, 40, 11, UI_TEXT_DIM, UI_ALIGN_RIGHT, "%02lu / %02lu",
+                 (unsigned long)(app->selected + 1), (unsigned long)count);
+    ui_hline(16, 57, 368, UI_LINE);
+    if (count) draw_library_art(app);
+
+    if (!count) {
+        const char *title = "No games here yet";
+        const char *hint = searching ? "Try a different search." : "Press Y to load your library, or X to search.";
+        if (!searching && app->client->game_count && app->library_tab == LIBRARY_TAB_FAVOURITES) {
+            title = "No favourites yet";
+            hint = "Open a game and press Y to add it here.";
+        } else if (!searching && app->client->game_count && app->library_tab == LIBRARY_TAB_RECENT) {
+            title = "Nothing played on Oboro yet";
+            hint = "Games you play show up here, newest first.";
+        }
+        if (!ui_image(UI_IMAGE_LANTERN, 164, 66, 0.75f, 1.0f)) {
+            ui_ring(200, 110, 26, 1.5f, UI_LINE_STRONG, UI_BG);
+            ui_text(200, 100, 18, UI_TEXT_FAINT, UI_ALIGN_CENTER, "空");
+        }
+        ui_text(200, 146, 13, UI_TEXT, UI_ALIGN_CENTER, title);
+        ui_text(200, 164, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, hint);
+    } else {
+        const float row_h = 25.0f;
+        const float target = 61.0f + (float)(app->selected - app->list_top) * row_h;
+        bar_y = entering || bar_y == 0.0f ? target : ui_approach(bar_y, target, 22.0f);
+        ui_rect(14, bar_y, LIB_LIST_W, 24, UI_RAISED);
+        ui_rect(14, bar_y, 2, 24, UI_ACCENT);
+    }
+
+    for (size_t row = 0; row < LIBRARY_ROWS; ++row) {
+        const size_t index = app->list_top + row;
+        const HostGame *game = app_game(app, index);
+        if (!game) break;
+        const float y = 61.0f + row * 25.0f;
+        const bool selected = index == app->selected;
+        game_art_want(game);
+        if (row > 0 && !selected && index != app->selected + 1)
+            ui_hline(44, y - 1, LIB_LIST_W - 36, C2D_Color32(0x16, 0x16, 0x1A, 0xFF));
+        ui_textf(36, y + 7, 11, selected ? UI_ACCENT : UI_TEXT_FAINT, UI_ALIGN_RIGHT,
+                 "%02lu", (unsigned long)(index + 1));
+        /* Favourites carry a small accent mark before the title. */
+        const bool favourite = game_prefs_favourite(game->app_id);
+        if (favourite) ui_rounded(42, y + 9, 5, 5, 2.5f, UI_ACCENT);
+        const float title_x = favourite ? 51.0f : 44.0f;
+        const char *store = store_label(game->store);
+        const float store_w = ui_text_width(store, 11) + 12;
+        ui_text_fit(title_x, y + 5, 13, selected ? UI_TEXT : UI_TEXT_DIM, UI_ALIGN_LEFT,
+                    LIB_LIST_W - title_x - store_w - 4, game->title);
+        ui_pill(10 + LIB_LIST_W, y + 4, selected ? UI_TEXT_DIM : UI_LINE_STRONG, UI_ALIGN_RIGHT, store);
+    }
+
+    /* Scroll rail. */
+    if (count > LIBRARY_ROWS) {
+        const float rail_y = 61, rail_h = 149;
+        const float thumb_h = rail_h * LIBRARY_ROWS / (float)count;
+        const float thumb_y = rail_y + (rail_h - thumb_h) * (float)app->list_top /
+                              (float)(count - LIBRARY_ROWS);
+        ui_vline(14 + LIB_LIST_W + 4, rail_y, rail_h, UI_LINE);
+        ui_rect(14 + LIB_LIST_W + 3, thumb_y, 3, thumb_h, UI_ACCENT);
+    }
+
+    static const char *const hints[] = {
+        "A", "Open", "L R", "Tabs", "X", "Search", "Y", "Refresh", NULL
+    };
+    static const char *const search_hints[] = {
+        "A", "Open", "X", "Search", "B", "Library", "SELECT", "Settings", NULL
+    };
+    draw_footer(UI_TOP_WIDTH, searching ? search_hints : hints);
+}
+
+static int session_stage(const App *app)
+{
+    if (app->client->session_state != HOST_SESSION_READY) return 0;
+    if (!app->transport->active) return 1;
+    if (moon_gameplay_ready(app->transport)) return 3;
+    return 2;
+}
+
+static bool session_failed(const App *app)
+{
+    return app->client->session_state == HOST_SESSION_ERROR || app->transport->state == MOON_FAILED;
+}
+
+static void draw_session_top(const App *app)
+{
+    static float progress_x;
+    const HostClient *client = app->client;
+    const bool failed = session_failed(app);
+    const int stage = session_stage(app);
+    const bool reconnecting = (app->reconnect_attempt > 0 && app->reconnect_attempt <= 3) || app->waiting_wifi;
+    static const char *const kanji[] = { "起", "接", "繋", "始" };
+    static const char *const jp[] = { "起動中", "接続中", "通信中", "開始" };
+    static const char *const en[] = { "STARTING ON YOUR PC", "CONNECTING", "SETTING UP THE STREAM", "STARTING STREAM" };
+
+    if (failed && !reconnecting) {
+        ui_ring(200, 86, 34, 2.0f, UI_DANGER, UI_BG);
+        ui_text(200, 68, 32, UI_DANGER, UI_ALIGN_CENTER, "!");
+        draw_title(200, 132, "エラー", "SESSION PROBLEM");
+        const char *detail = client->session_state == HOST_SESSION_ERROR ? client->status : app->transport->status;
+        ui_text_wrap(200, 162, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, 340, 3, 14, detail);
+        static const char *const hints[] = { "A", "Retry", "B", "Leave", NULL };
+        draw_footer(UI_TOP_WIDTH, hints);
+        return;
+    }
+
+    ui_enso(200, 84, 34, reconnecting ? UI_KIN : UI_ACCENT);
+    if (reconnecting) {
+        ui_text(200, 70, 26, UI_TEXT, UI_ALIGN_CENTER, "再");
+        draw_title(200, 126, "再接続中", "RECONNECTING");
+        ui_text_fit(200, 156, 13, UI_TEXT_DIM, UI_ALIGN_CENTER, 360, app->game_title);
+        if (app->waiting_wifi)
+            ui_text(200, 172, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER,
+                    app->lid_paused ? "Paused with the lid closed; reconnecting when you open it."
+                                    : "Waiting for Wi-Fi to come back; your game keeps running.");
+        else
+            ui_textf(200, 172, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER,
+                     "The connection dropped. Attempt %u of 3; your game keeps running.",
+                     app->reconnect_attempt);
+    } else {
+        ui_text(200, 70, 26, UI_TEXT, UI_ALIGN_CENTER, kanji[stage]);
+        draw_title(200, 126, jp[stage], en[stage]);
+        ui_text_fit(200, 156, 13, UI_TEXT_DIM, UI_ALIGN_CENTER, 360,
+                    app->game_title[0] ? app->game_title : "Your PC");
+        ui_text_fit(200, 172, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, 360,
+                    app->transport->active ? app->transport->status : client->status);
+    }
+
+    /* Four-step progress: launch, connect, handshake, stream. The filled line glides. */
+    static const char *const steps[] = { "LAUNCH", "CONNECT", "SETUP", "STREAM" };
+    const float step_x0 = 95, step_dx = 70, step_y = 194;
+    progress_x = ui_approach(progress_x, step_dx * (float)stage, 8.0f);
+    ui_hline(step_x0, step_y, step_dx * 3, UI_LINE);
+    ui_hline(step_x0, step_y, progress_x, UI_ACCENT);
+    const float pulse = 0.5f + 0.5f * sinf((float)ui_ticks() / 180.0f);
+    for (int i = 0; i < 4; ++i) {
+        const float x = step_x0 + step_dx * i;
+        if (i < stage) ui_circle(x, step_y, 4, UI_ACCENT);
+        else if (i == stage) {
+            ui_circle(x, step_y, 5.5f + pulse, ui_with_alpha(UI_ACCENT, 0x50));
+            ui_ring(x, step_y, 4.5f, 1.5f, UI_ACCENT, UI_BG);
+        } else ui_ring(x, step_y, 4, 1.0f, UI_LINE_STRONG, UI_BG);
+        ui_label(x, step_y + 8, 11, i <= stage ? UI_TEXT_DIM : UI_TEXT_FAINT, UI_ALIGN_CENTER, steps[i]);
+    }
+    static const char *const hints[] = { "B", "Leave", NULL };
+    ui_hint_row(200, 223, hints);
+}
+
+static void draw_settings_top(const App *app, bool entering)
+{
+    static float scroll, bar_y;
+    draw_title(200, 31, "設定", "SETTINGS");
+    ui_hline(16, 57, 368, UI_LINE);
+
+    /* Lay the grouped list out once per frame. */
+    enum { HEADER_H = 22, ROW_H = 20 };
+    float ys[SETTING_ENTRY_COUNT];
+    float content = 0.0f, selected_y = 0.0f;
+    const int selected = screens_setting_at(app->setting_index);
+    for (int i = 0; i < SETTING_ENTRY_COUNT; ++i) {
+        ys[i] = content;
+        if (SETTING_ENTRIES[i].setting == selected) selected_y = content;
+        content += SETTING_ENTRIES[i].setting < 0 ? HEADER_H : ROW_H;
+    }
+    const float view_h = LIST_BOTTOM - LIST_TOP;
+    float target = selected_y - view_h / 2.0f + ROW_H / 2.0f;
+    if (target > content - view_h) target = content - view_h;
+    if (target < 0.0f) target = 0.0f;
+    scroll = entering ? target : ui_approach(scroll, target, 16.0f);
+    const float bar_target = LIST_TOP + selected_y - scroll;
+    bar_y = entering || bar_y == 0.0f ? bar_target : ui_approach(bar_y, bar_target, 24.0f);
+
+    /* Rows fade out at the viewport edges instead of being cut off. */
+    #define EDGE_ALPHA(top, h) \
+        (fminf(1.0f, fmaxf(0.0f, ((top) - LIST_TOP + 8.0f) / 8.0f)) * \
+         fminf(1.0f, fmaxf(0.0f, (LIST_BOTTOM - ((top) + (h)) + 8.0f) / 8.0f)))
+
+    const float bar_alpha = EDGE_ALPHA(bar_y, ROW_H - 1);
+    if (bar_alpha > 0.0f) draw_selection(bar_y, ROW_H - 1, bar_alpha);
+
+    for (int i = 0; i < SETTING_ENTRY_COUNT; ++i) {
+        const SettingEntry *e = &SETTING_ENTRIES[i];
+        const float y = LIST_TOP + ys[i] - scroll;
+        const float h = e->setting < 0 ? HEADER_H : ROW_H;
+        const float a = EDGE_ALPHA(y, h);
+        if (a <= 0.02f) continue;
+        const u8 alpha = (u8)(255.0f * a);
+        if (e->setting < 0) {
+            if (ui_has_japanese()) {
+                const float w = ui_text(18, y + 5, 11, ui_with_alpha(UI_ACCENT, alpha), UI_ALIGN_LEFT, e->jp);
+                ui_label(18 + w + 6, y + 6, 11, ui_with_alpha(UI_TEXT_FAINT, alpha), UI_ALIGN_LEFT, e->en);
+            } else {
+                ui_label(18, y + 6, 11, ui_with_alpha(UI_ACCENT, alpha), UI_ALIGN_LEFT, e->en);
+            }
+            continue;
+        }
+        const int s = e->setting;
+        const bool is_selected = s == selected;
+        const bool account = s == SETTING_ACCOUNT;
+        const float label_w = ui_text(28, y + 3, 12,
+                                      ui_with_alpha(is_selected ? UI_TEXT : UI_TEXT_DIM, alpha),
+                                      UI_ALIGN_LEFT, SETTING_LABELS[s]);
+        ui_text(28 + label_w + 7, y + 4, 11, ui_with_alpha(UI_TEXT_FAINT, alpha), UI_ALIGN_LEFT,
+                SETTING_JP[s]);
+        const u32 value_color = account ? UI_DANGER : is_selected ? UI_TEXT : UI_TEXT_DIM;
+        const float value_right = is_selected && !account ? 364.0f : 378.0f;
+        const float value_w = ui_text(value_right, y + 3, 12, ui_with_alpha(value_color, alpha),
+                                      UI_ALIGN_RIGHT, setting_value(app, s));
+        if (is_selected && !account) {
+            const float cy = y + 9.5f;
+            const float lx = value_right - value_w - 10;
+            ui_triangle(lx + 3, cy - 4, lx + 3, cy + 4, lx - 2, cy, ui_with_alpha(UI_ACCENT, alpha));
+            ui_triangle(371, cy - 4, 371, cy + 4, 376, cy, ui_with_alpha(UI_ACCENT, alpha));
+        }
+    }
+    #undef EDGE_ALPHA
+
+    /* Scroll rail. */
+    if (content > view_h) {
+        const float rail_h = view_h - 2;
+        const float thumb_h = rail_h * view_h / content;
+        const float thumb_y = LIST_TOP + (rail_h - thumb_h) * scroll / (content - view_h);
+        ui_vline(392, LIST_TOP, rail_h, UI_LINE);
+        ui_rect(391, thumb_y, 3, thumb_h, UI_ACCENT);
+    }
+    static const char *const hints[] = { "A", "Change", "B", "Save & back", NULL };
+    draw_footer(UI_TOP_WIDTH, hints);
+}
+
+/* "Help improve Oboro?": asked once, after an update or the first start. */
+static void draw_share_ask_top(float p)
+{
+    ui_rect(0, 26, UI_TOP_WIDTH, 214, ui_with_alpha(UI_BG, (u8)(0xE0 * p)));
+    ui_offset(0.0f, (1.0f - p) * 10.0f);
+    const UiRect panel = { 36, 36, 328, 176 };
+    draw_card(panel, p);
+    ui_enso(200, 66, 20, ui_with_alpha(UI_ACCENT, (u8)(0xFF * p)));
+    ui_text(200, 55, 18, UI_ACCENT, UI_ALIGN_CENTER, "協");
+    draw_title(200, 92, "協力のお願い", "HELP IMPROVE OBORO?");
+    ui_text_wrap(200, 118, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, 300, 2, 14,
+                 "Share diagnostics with the developer to find bugs and make streaming smoother.");
+    static const char *const points[3] = {
+        "Problem reports: the log, after a crash or failed stream",
+        "Performance stats: ping and smoothness after each session",
+        "Never your login · change it in Settings > System",
+    };
+    for (int i = 0; i < 3; ++i) {
+        const float y = 150 + i * 15.0f;
+        ui_rounded(76, y + 5, 4, 4, 2.0f, UI_ACCENT);
+        ui_text(86, y, 11, UI_TEXT, UI_ALIGN_LEFT, points[i]);
+    }
+    static const char *const hints[] = { "A", "Share", "B", "No thanks", NULL };
+    ui_hint_row(200, 200, hints);
+    ui_offset(0.0f, 0.0f);
+}
+
+static void draw_modal_top(const App *app, float p)
+{
+    if (app->modal == MODAL_SHARE_ASK) {
+        draw_share_ask_top(p);
+        return;
+    }
+    ui_rect(0, 26, UI_TOP_WIDTH, 214, ui_with_alpha(UI_BG, (u8)(0xC8 * p)));
+    ui_offset(0.0f, (1.0f - p) * 10.0f);
+    const UiRect panel = { 60, 56, 280, 128 };
+    draw_card(panel, p);
+    draw_title(200, 66, app->modal_jp, app->modal_title);
+    if (app->modal == MODAL_REPORT_SENT) {
+        /* The code is what the player writes down: make it big. */
+        ui_text(200, 92, 26, UI_ACCENT, UI_ALIGN_CENTER, app->report_code);
+        ui_text_wrap(200, 126, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, 250, 2, 14, app->modal_text);
+    } else {
+        ui_text_wrap(200, 98, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, 250, 4, 14, app->modal_text);
+    }
+    static const char *const confirm[] = { "A", "Confirm", "B", "Cancel", NULL };
+    static const char *const error[] = { "A", "Retry", "B", "Back", NULL };
+    static const char *const send[] = { "A", "Send", "B", "Cancel", NULL };
+    static const char *const done[] = { "A", "OK", NULL };
+    static const char *const quit_other[] = { "A", "Quit it", "B", "Back", NULL };
+    ui_hint_row(200, 162, app->modal == MODAL_ERROR ? error : app->modal == MODAL_SEND_REPORT ? send :
+                          app->modal == MODAL_REPORT_SENT ? done :
+                          app->modal == MODAL_CONFLICT ? quit_other : confirm);
+    ui_offset(0.0f, 0.0f);
+}
+
+/* ---- Game details ---------------------------------------------------------- */
+
+static const char *details_store(const App *app, const HostGame *game)
+{
+    if (app->details_variant < game->variant_count) return store_label(game->variants[app->details_variant].store);
+    return store_label(game->store);
+}
+
+static void format_played(char *out, size_t size, uint32_t seconds)
+{
+    if (seconds >= 3600) snprintf(out, size, "%lu h %02lu m", (unsigned long)(seconds / 3600),
+                                  (unsigned long)(seconds / 60 % 60));
+    else snprintf(out, size, "%lu min", (unsigned long)(seconds / 60));
+}
+
+static void details_fact(float x, float y, const char *label, const char *value)
+{
+    ui_label(x, y, 11, UI_TEXT_FAINT, UI_ALIGN_LEFT, label);
+    ui_text_fit(x, y + 14, 13, UI_TEXT, UI_ALIGN_LEFT, 108, value);
+}
+
+static void draw_details_top(const App *app)
+{
+    const HostGame *game = app_game(app, app->selected);
+    if (!game) return;
+    /* Cover on the left, facts on the right. */
+    draw_game_art(game, 22, 38, 120, 1.0f);
+    const float x = 160, w = 224;
+    const int lines = ui_text_wrap(x, 36, 16, UI_TEXT, UI_ALIGN_LEFT, w, 2, 19, game->title);
+    float y = 40 + lines * 19.0f;
+    /* Store versions, the chosen one lit. */
+    float px = x;
+    if (game->variant_count > 1) {
+        for (unsigned i = 0; i < game->variant_count; ++i) {
+            const bool on = i == app->details_variant;
+            px += ui_pill(px, y, on ? UI_ACCENT : UI_LINE_STRONG, UI_ALIGN_LEFT, store_label(game->variants[i].store)) + 6;
+        }
+    } else {
+        px += ui_pill(px, y, UI_TEXT_DIM, UI_ALIGN_LEFT, details_store(app, game)) + 6;
+    }
+    if (game_prefs_favourite(game->app_id)) ui_pill(px, y, UI_ACCENT, UI_ALIGN_LEFT, "FAVOURITE");
+    y += 28;
+    ui_hline(x, y, w, UI_LINE);
+    y += 8;
+
+    PlayHistory history = {0};
+    const bool played = play_history_get(game->app_id, &history) ||
+                        (app->details_variant < game->variant_count &&
+                         play_history_get(game->variants[app->details_variant].id, &history));
+    char value[48];
+    if (played && history.seconds) format_played(value, sizeof(value), history.seconds);
+    else snprintf(value, sizeof(value), played ? "Under a minute" : "Not yet");
+    details_fact(x, y, "PLAYED ON OBORO", value);
+    snprintf(value, sizeof(value), "%lu", (unsigned long)history.sessions);
+    details_fact(x + 118, y, "SESSIONS", value);
+    y += 38;
+    if (played && history.last_played) {
+        const time_t when = (time_t)history.last_played;
+        const struct tm *t = gmtime(&when);
+        if (t) strftime(value, sizeof(value), "%d %b %Y", t);
+        else snprintf(value, sizeof(value), "-");
+    } else {
+        snprintf(value, sizeof(value), "-");
+    }
+    details_fact(x, y, "LAST PLAYED", value);
+    const GamePrefs prefs = game_prefs_get(game->app_id);
+    details_fact(x + 118, y, "GAME OPTIONS",
+                 prefs.bitrate >= 0 || prefs.gyro >= 0 || prefs.layout >= 0 ? "Custom" : "Default");
+    y += 38;
+    ui_label(x, y, 11, UI_TEXT_FAINT, UI_ALIGN_LEFT, "STREAM");
+    ui_text_fit(x, y + 14, 12, UI_TEXT_DIM, UI_ALIGN_LEFT, w, stream_profile_name());
+
+    static const char *const hints[] = { "A", "Play", "Y", "Favourite", "X", "Options", "B", "Back", NULL };
+    draw_footer(UI_TOP_WIDTH, hints);
+}
+
+/* The per-game options sheet: rows of "setting  < value >". */
+static const char *option_value(const App *app, const GamePrefs *prefs, int row, char *buffer, size_t size)
+{
+    static const char *const bitrates[STREAM_BITRATE_COUNT] = { "Balanced", "Steady 1", "Steady 1.2", "Steady 1.5", "Sharp" };
+    static const char *const gyros[HOST_GYRO_MODE_COUNT] = { "Off", "Always", "While aiming" };
+    static const char *const layouts[2] = { "Position", "Letters" };
+    switch (row) {
+    case OPTION_BITRATE:
+        if (prefs->bitrate >= 0) return bitrates[prefs->bitrate % STREAM_BITRATE_COUNT];
+        /* Say what Default means, so a game's own choice is never a surprise. */
+        snprintf(buffer, size, "Default (%s)", bitrates[app->settings.bitrate_mode % STREAM_BITRATE_COUNT]);
+        return buffer;
+    case OPTION_GYRO: return prefs->gyro < 0 ? "Default" : gyros[prefs->gyro % HOST_GYRO_MODE_COUNT];
+    case OPTION_LAYOUT: return prefs->layout < 0 ? "Default" : layouts[prefs->layout % 2];
+    case OPTION_MAPPING: return prefs->has_map ? "Custom  ·  A to edit" : "Default  ·  A to edit";
+    }
+    return "";
+}
+
+static void draw_options_sheet(const App *app, float p)
+{
+    const HostGame *game = app_game(app, app->selected);
+    if (!game) return;
+    const GamePrefs prefs = game_prefs_get(game->app_id);
+    ui_rect(0, 0, UI_BOTTOM_WIDTH, UI_HEIGHT, ui_with_alpha(UI_BG, (u8)(0xF0 * p)));
+    ui_offset(0.0f, (1.0f - p) * 10.0f);
+    ui_text(160, 3, 12, UI_ACCENT, UI_ALIGN_CENTER, "設定");
+    ui_label(160, 18, 11, UI_TEXT, UI_ALIGN_CENTER, "OPTIONS FOR THIS GAME");
+    ui_hline(16, 33, 288, UI_LINE);
+    static const char *const labels[OPTION_COUNT] = { "Bitrate", "Gyro aim", "Button layout", "Button mapping" };
+    char buffer[64];
+    for (int i = 0; i < OPTION_COUNT; ++i) {
+        const float y = OPT_ROW_Y + i * OPT_ROW_H;
+        const bool focus = i == app->options_index;
+        if (focus) {
+            ui_rect(12, y, 296, OPT_ROW_H - 4, UI_RAISED);
+            ui_rect(12, y, 2, OPT_ROW_H - 4, UI_ACCENT);
+        }
+        ui_text(24, y + 7, 12, focus ? UI_TEXT : UI_TEXT_DIM, UI_ALIGN_LEFT, labels[i]);
+        const char *value = option_value(app, &prefs, i, buffer, sizeof(buffer));
+        const bool custom = (i == OPTION_BITRATE && prefs.bitrate >= 0) ||
+                            (i == OPTION_GYRO && prefs.gyro >= 0) || (i == OPTION_LAYOUT && prefs.layout >= 0) ||
+                            (i == OPTION_MAPPING && prefs.has_map);
+        ui_text_fit(296, y + 7, 12, custom ? UI_ACCENT : focus ? UI_TEXT : UI_TEXT_DIM, UI_ALIGN_RIGHT,
+                    180, value);
+    }
+    ui_text_wrap(160, OPT_ROW_Y + OPTION_COUNT * OPT_ROW_H + 1, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, 292, 1, 14,
+                 "Default follows Settings. Only this game's sessions use these.");
+    ui_button(OPT_CLOSE, "DONE", "完了", UI_BUTTON_NORMAL, pressed(app, OPT_CLOSE));
+    ui_offset(0.0f, 0.0f);
+}
+
+/* PlayStation symbol for face outputs, next to its name. */
+static float draw_output(float cx, float y, float size, unsigned output, u32 color)
+{
+    const char *name = host_output_name(output);
+    const float w = ui_text_width(name, size);
+    const bool face = output >= HOST_OUT_CROSS && output <= HOST_OUT_TRIANGLE;
+    float x = cx - (w + (face ? size + 6 : 0)) / 2;
+    if (face) {
+        const float s = size * 0.8f, sy = y + size * 0.55f;
+        if (output == HOST_OUT_CROSS) ui_ps_cross(x + s / 2, sy, s, UI_AI);
+        else if (output == HOST_OUT_CIRCLE) ui_ps_circle(x + s / 2, sy, s, UI_DANGER);
+        else if (output == HOST_OUT_SQUARE) ui_ps_square(x + s / 2, sy, s, UI_SAKURA);
+        else ui_ps_triangle(x + s / 2, sy, s, UI_MATCHA);
+        x += size + 6;
+    }
+    ui_text(x, y, size, color, UI_ALIGN_LEFT, name);
+    return w;
+}
+
+static void draw_mapping_top(const App *app)
+{
+    const HostGame *game = app_game(app, app->selected);
+    draw_title(200, 31, "ボタン設定", "BUTTON MAPPING");
+    if (game) ui_text_fit(200, 60, 12, UI_TEXT_DIM, UI_ALIGN_CENTER, 340, game->title);
+    /* Two columns of seven: 3DS button -> what it sends. */
+    for (int i = 0; i < HOST_INPUT_COUNT; ++i) {
+        const float x = i < 7 ? 22 : 206, y = 80 + (i % 7) * 19.0f;
+        const bool on = i == app->mapping_input;
+        const bool changed = app->mapping[i] != app->mapping_default[i];
+        if (on) {
+            ui_rect(x - 6, y - 2, 178, 18, UI_RAISED);
+            ui_rect(x - 6, y - 2, 2, 18, UI_ACCENT);
+        }
+        ui_button_chip(x, y, host_input_name((unsigned)i), on ? UI_TEXT : UI_TEXT_DIM);
+        ui_text(x + 74, y, 12, changed ? UI_ACCENT : on ? UI_TEXT : UI_TEXT_DIM, UI_ALIGN_LEFT,
+                host_output_name(app->mapping[i]));
+    }
+    static const char *const hints[] = { "ANY BUTTON", "Pick", "CIRCLE PAD", "Change", NULL };
+    draw_footer(UI_TOP_WIDTH, hints);
+}
+
+static void draw_mapping_bottom(const App *app)
+{
+    ui_label(160, 8, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "PRESS ANY 3DS BUTTON TO PICK IT");
+    const UiRect card = { 70, 30, 180, 128 };
+    ui_panel(card, UI_ACCENT);
+    const unsigned input = (unsigned)app->mapping_input;
+    ui_label(160, card.y + 12, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "3DS BUTTON");
+    const float chip_w = ui_text_width(host_input_name(input), 10) + 10;
+    ui_button_chip(160 - (strlen(host_input_name(input)) == 1 ? 7.5f : chip_w / 2), card.y + 30,
+                   host_input_name(input), UI_TEXT);
+    ui_label(160, card.y + 60, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "SENDS");
+    draw_output(160, card.y + 78, 16, app->mapping[input],
+                app->mapping[input] != app->mapping_default[input] ? UI_ACCENT : UI_TEXT);
+    draw_arrow(MAP_PREV, -1, true, pressed(app, MAP_PREV));
+    draw_arrow(MAP_NEXT, 1, true, pressed(app, MAP_NEXT));
+    ui_text(160, 168, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, "Circle Pad left / right also changes it");
+    ui_button(MAP_RESET, "RESET", "初期化", UI_BUTTON_NORMAL, pressed(app, MAP_RESET));
+    ui_button(MAP_CANCEL, "CANCEL", "取消", UI_BUTTON_NORMAL, pressed(app, MAP_CANCEL));
+    ui_button(MAP_DONE, "SAVE", "保存", UI_BUTTON_PRIMARY, pressed(app, MAP_DONE));
+}
+
+static void draw_details_bottom(const App *app, float overlay_p)
+{
+    const HostGame *game = app_game(app, app->selected);
+    if (!game) return;
+    draw_status_strip(app, app->status);
+    ui_button(DET_PLAY, "PLAY", "遊ぶ", UI_BUTTON_PRIMARY, pressed(app, DET_PLAY));
+    const bool choice = game->variant_count > 1;
+    draw_arrow(DET_STORE_PREV, -1, choice, pressed(app, DET_STORE_PREV));
+    draw_arrow(DET_STORE_NEXT, 1, choice, pressed(app, DET_STORE_NEXT));
+    ui_label(160, 110, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, choice ? "LAUNCH FROM  (LEFT / RIGHT)" : "LAUNCH FROM");
+    ui_text_fit(160, 126, 15, UI_TEXT, UI_ALIGN_CENTER, 180, details_store(app, game));
+    if (choice) ui_dots(160, 152, game->variant_count, app->details_variant, UI_ACCENT, UI_LINE_STRONG);
+    const bool favourite = game_prefs_favourite(game->app_id);
+    ui_button(DET_FAV, favourite ? "SAVED" : "FAVOURITE", "お気に入り",
+              favourite ? UI_BUTTON_ACTIVE : UI_BUTTON_NORMAL, pressed(app, DET_FAV));
+    ui_button(DET_OPTIONS, "OPTIONS", "設定", UI_BUTTON_NORMAL, pressed(app, DET_OPTIONS));
+    ui_button(DET_BACK, "BACK", "戻る", UI_BUTTON_NORMAL, pressed(app, DET_BACK));
+    if (app->mapping_open) {
+        ui_rect(0, 0, UI_BOTTOM_WIDTH, UI_HEIGHT, UI_BG);
+        draw_mapping_bottom(app);
+    } else if (app->options_open) {
+        draw_options_sheet(app, overlay_p);
+    }
+}
+
+/* ---- Software update --------------------------------------------------------- */
+
+/* Word-wrapped, scrollable notes inside a panel; lines fade at the edges. */
+static void draw_notes(UiRect box, const char *text, int scroll)
+{
+    ui_rect_r(box, UI_SURFACE);
+    ui_outline(box.x, box.y, box.w, box.h, 1.0f, UI_LINE);
+    const float line_h = 15.0f, pad = 8.0f, width = box.w - pad * 2;
+    const int visible = (int)((box.h - pad * 2) / line_h);
+    /* First pass counts lines so the scroll can be clamped. */
+    int total = 0;
+    char line[256];
+    for (int pass = 0; pass < 2; ++pass) {
+        int max_scroll = total - visible;
+        if (max_scroll < 0) max_scroll = 0;
+        const int first = scroll > max_scroll ? max_scroll : scroll;
+        int index = 0;
+        const char *p = text && text[0] ? text : "No release notes.";
+        while (*p) {
+            const char *end = strchr(p, '\n');
+            const size_t para = end ? (size_t)(end - p) : strlen(p);
+            size_t start = 0;
+            do {
+                /* Grow the line word by word. */
+                size_t best = 0, cursor = start;
+                while (cursor < para) {
+                    size_t next = cursor;
+                    while (next < para && p[next] == ' ') ++next;
+                    while (next < para && p[next] != ' ') ++next;
+                    const size_t len = next - start < sizeof(line) - 1 ? next - start : sizeof(line) - 1;
+                    memcpy(line, p + start, len);
+                    line[len] = '\0';
+                    if (ui_text_width(line, 12) > width && best) break;
+                    best = next - start;
+                    cursor = next;
+                }
+                if (!best) best = para - start;
+                if (pass == 1 && index >= first && index < first + visible) {
+                    const size_t len = best < sizeof(line) - 1 ? best : sizeof(line) - 1;
+                    memcpy(line, p + start, len);
+                    line[len] = '\0';
+                    const bool bullet = line[0] == '-' && line[1] == ' ';
+                    const float y = box.y + pad + (index - first) * line_h;
+                    if (bullet) {
+                        ui_circle(box.x + pad + 3, y + 7, 2, UI_ACCENT);
+                        ui_text(box.x + pad + 10, y, 12, UI_TEXT, UI_ALIGN_LEFT, line + 2);
+                    } else {
+                        ui_text(box.x + pad, y, 12, UI_TEXT_DIM, UI_ALIGN_LEFT, line);
+                    }
+                }
+                ++index;
+                start += best;
+                while (start < para && p[start] == ' ') ++start;
+            } while (start < para);
+            if (!end) break;
+            p = end + 1;
+        }
+        total = index;
+        if (pass == 1 && total > visible) {
+            /* Scroll hint on the right edge. */
+            const float rail = box.h - 8, thumb = rail * visible / total;
+            ui_vline(box.x + box.w - 5, box.y + 4, rail, UI_LINE);
+            ui_rect(box.x + box.w - 6, box.y + 4 + (rail - thumb) * first / (float)(total - visible), 3, thumb,
+                    UI_ACCENT);
+        }
+    }
+}
+
+static const char *update_phase_title(const UpdateInfo *info)
+{
+    switch (info->state) {
+    case UPDATE_CHECKING: return "Checking GitHub for updates";
+    case UPDATE_DOWNLOADING: return "Downloading";
+    case UPDATE_VERIFYING: return "Checking the download";
+    case UPDATE_INSTALLING: return "Installing - keep the console on";
+    case UPDATE_INSTALLED: return "Update installed";
+    case UPDATE_FAILED: return "Update didn't finish";
+    case UPDATE_AVAILABLE: return "A new version is ready";
+    case UPDATE_UP_TO_DATE: return "Oboro is up to date";
+    default: return "Software update";
+    }
+}
+
+static void draw_update_top(const App *app)
+{
+    const UpdateInfo info = updater_info();
+    draw_title(200, 31, "更新", "SOFTWARE UPDATE");
+    const bool has_new = info.latest[0] && info.state != UPDATE_UP_TO_DATE && info.state != UPDATE_IDLE &&
+                         info.state != UPDATE_CHECKING;
+    if (has_new) {
+        /* Installed -> available, side by side. */
+        const UiRect left = { 40, 60, 140, 40 }, right = { 220, 60, 140, 40 };
+        ui_rect_r(left, UI_SURFACE);
+        ui_outline(left.x, left.y, left.w, left.h, 1.0f, UI_LINE);
+        ui_label(left.x + left.w / 2, left.y + 5, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "INSTALLED");
+        ui_text_fit(left.x + left.w / 2, left.y + 20, 13, UI_TEXT_DIM, UI_ALIGN_CENTER, left.w - 8, APP_VERSION);
+        ui_rect_r(right, UI_SURFACE);
+        ui_outline(right.x, right.y, right.w, right.h, 1.0f, UI_ACCENT);
+        ui_label(right.x + right.w / 2, right.y + 5, 11, UI_ACCENT, UI_ALIGN_CENTER,
+                 info.prerelease ? "NEW BETA" : "NEW");
+        ui_text_fit(right.x + right.w / 2, right.y + 20, 13, UI_TEXT, UI_ALIGN_CENTER, right.w - 8, info.latest);
+        ui_triangle(194, 74, 194, 86, 204, 80, UI_ACCENT);
+        char heading[64];
+        snprintf(heading, sizeof(heading), "WHAT'S NEW  ·  %s", info.published[0] ? info.published : info.latest);
+        ui_label(40, 106, 11, UI_TEXT_FAINT, UI_ALIGN_LEFT, heading);
+        const UiRect notes = { 36, 120, 328, 94 };
+        draw_notes(notes, info.notes, app->notes_scroll);
+    } else if (info.state == UPDATE_CHECKING || info.state == UPDATE_IDLE) {
+        ui_enso(200, 118, 24, UI_ACCENT);
+        ui_text(200, 156, 13, UI_TEXT, UI_ALIGN_CENTER, "Checking GitHub for a newer Oboro...");
+    } else {
+        const bool ok = info.state == UPDATE_UP_TO_DATE;
+        ui_ring(200, 110, 26, 2.0f, ok ? UI_ACCENT : UI_DANGER, UI_BG);
+        if (ok) {
+            ui_line(188, 110, 197, 119, 3.0f, UI_ACCENT);
+            ui_line(197, 119, 213, 101, 3.0f, UI_ACCENT);
+        } else {
+            ui_text(200, 94, 26, UI_DANGER, UI_ALIGN_CENTER, "!");
+        }
+        ui_text(200, 146, 14, UI_TEXT, UI_ALIGN_CENTER, ok ? "Oboro is up to date" : "Could not check for updates");
+        char detail[160];
+        if (ok && info.checked_at) {
+            const long age = (long)((int64_t)time(NULL) - info.checked_at);
+            if (age < 120) snprintf(detail, sizeof(detail), "Version %s  ·  checked just now", APP_VERSION);
+            else snprintf(detail, sizeof(detail), "Version %s  ·  checked %ld min ago", APP_VERSION, age / 60);
+        } else {
+            snprintf(detail, sizeof(detail), "%s", ok ? APP_VERSION : info.error);
+        }
+        ui_text_wrap(200, 166, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, 330, 2, 14, detail);
+    }
+    static const char *const hints_new[] = { "A", "Install", "X", "Later", "B", "Close", NULL };
+    static const char *const hints[] = { "A", "Check again", "B", "Close", NULL };
+    static const char *const hints_busy[] = { NULL };
+    const bool working = info.state == UPDATE_DOWNLOADING || info.state == UPDATE_VERIFYING ||
+                         info.state == UPDATE_INSTALLING || info.state == UPDATE_CHECKING;
+    draw_footer(UI_TOP_WIDTH, working ? hints_busy : info.state == UPDATE_AVAILABLE ? hints_new : hints);
+}
+
+static void draw_update_bottom(const App *app)
+{
+    static float bar;
+    const UpdateInfo info = updater_info();
+    ui_label(160, 8, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "SOFTWARE UPDATE");
+    ui_text(160, 26, 14, info.state == UPDATE_FAILED ? UI_DANGER : UI_TEXT, UI_ALIGN_CENTER,
+            update_phase_title(&info));
+
+    /* Three steps with one continuous bar underneath. */
+    static const char *const steps[] = { "DOWNLOAD", "VERIFY", "INSTALL" };
+    int step = -1;
+    if (info.state == UPDATE_DOWNLOADING) step = 0;
+    else if (info.state == UPDATE_VERIFYING) step = 1;
+    else if (info.state == UPDATE_INSTALLING) step = 2;
+    else if (info.state == UPDATE_INSTALLED) step = 3;
+    const float overall = step < 0 ? 0.0f : step >= 3 ? 1.0f : (step + info.progress / 1000.0f) / 3.0f;
+    bar = ui_approach(bar, overall, 10.0f);
+    const float bx = 30, bw = 260, by = 76;
+    ui_rounded(bx, by, bw, 6, 3, UI_RAISED);
+    if (bar > 0.005f) ui_rounded(bx, by, bw * bar, 6, 3, info.state == UPDATE_FAILED ? UI_DANGER : UI_ACCENT);
+    for (int i = 0; i < 3; ++i) {
+        const float x = bx + bw * (i + 0.5f) / 3.0f;
+        const bool done = step > i, now = step == i;
+        ui_label(x, by + 14, 11, done || now ? UI_TEXT : UI_TEXT_FAINT, UI_ALIGN_CENTER, steps[i]);
+    }
+    char detail[160] = "";
+    if (info.state == UPDATE_DOWNLOADING && info.size_bytes)
+        snprintf(detail, sizeof(detail), "%.1f of %.1f MB", info.progress / 1000.0f * info.size_bytes / 1048576.0f,
+                 info.size_bytes / 1048576.0f);
+    else if (info.state == UPDATE_AVAILABLE && info.size_bytes)
+        snprintf(detail, sizeof(detail), "%s  ·  %.1f MB  ·  %s", info.latest, info.size_bytes / 1048576.0f,
+                 updater_is_3dsx() ? ".3dsx" : "CIA");
+    else if (info.state == UPDATE_INSTALLED)
+        snprintf(detail, sizeof(detail), updater_can_relaunch() ? "Restart to use %s." : "Close Oboro and open it again to use %s.",
+                 info.latest);
+    else if (info.state == UPDATE_FAILED)
+        snprintf(detail, sizeof(detail), "%s", info.error);
+    else if (info.state == UPDATE_INSTALLING)
+        snprintf(detail, sizeof(detail), "Your login, library and settings stay as they are.");
+    ui_text_wrap(160, 112, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, 290, 2, 14, detail);
+
+    const bool working = info.state == UPDATE_DOWNLOADING || info.state == UPDATE_VERIFYING ||
+                         info.state == UPDATE_INSTALLING || info.state == UPDATE_CHECKING;
+    char label[48];
+    const char *jp = "確認";
+    if (info.state == UPDATE_AVAILABLE) { snprintf(label, sizeof(label), "INSTALL %s", info.latest); jp = "インストール"; }
+    else if (info.state == UPDATE_INSTALLED) {
+        snprintf(label, sizeof(label), "%s", updater_can_relaunch() ? "RESTART OBORO" : "EXIT OBORO");
+        jp = "再起動";
+    } else if (info.state == UPDATE_FAILED) { snprintf(label, sizeof(label), "TRY AGAIN"); jp = "再試行"; }
+    else if (working) { snprintf(label, sizeof(label), "PLEASE WAIT"); jp = "処理中"; }
+    else snprintf(label, sizeof(label), "CHECK AGAIN");
+    ui_button(UPD_PRIMARY, label, jp, working ? UI_BUTTON_NORMAL : UI_BUTTON_PRIMARY, pressed(app, UPD_PRIMARY));
+    if (!working) {
+        if (info.state == UPDATE_AVAILABLE)
+            ui_button(UPD_LATER, "LATER", "後で", UI_BUTTON_NORMAL, pressed(app, UPD_LATER));
+        ui_button(info.state == UPDATE_AVAILABLE ? UPD_CLOSE : (UiRect){ 90, 200, 140, 34 }, "CLOSE", "閉じる",
+                  UI_BUTTON_NORMAL, pressed(app, UPD_CLOSE));
+    }
+}
+
+static void draw_whats_new_top(const App *app)
+{
+    draw_title(200, 31, "新機能", "WHAT'S NEW");
+    char heading[64];
+    snprintf(heading, sizeof(heading), "Oboro %s", app->whats_new_version);
+    ui_text(200, 62, 15, UI_TEXT, UI_ALIGN_CENTER, heading);
+    const UiRect notes = { 30, 86, 340, 126 };
+    draw_notes(notes, app->whats_new_notes, app->notes_scroll);
+    static const char *const hints[] = { "A", "Continue", NULL };
+    draw_footer(UI_TOP_WIDTH, hints);
+}
+
+static void draw_whats_new_bottom(const App *app)
+{
+    const UiRect card = { 30, 40, 260, 120 };
+    ui_panel(card, UI_ACCENT);
+    ui_seal(144, card.y + 16, 32);
+    ui_text(160, card.y + 58, 14, UI_TEXT, UI_ALIGN_CENTER, "Oboro was updated");
+    ui_text(160, card.y + 80, 12, UI_ACCENT, UI_ALIGN_CENTER, app->whats_new_version);
+    ui_button(NEW_CONTINUE, "CONTINUE", "続ける", UI_BUTTON_PRIMARY, pressed(app, NEW_CONTINUE));
+}
+
+/* ---- First-run guide ------------------------------------------------------- */
+
+typedef struct {
+    const char *kanji, *jp, *en, *body, *tip;
+} GuidePage;
+
+static const GuidePage GUIDE[GUIDE_PAGES] = {
+    { "朧", "ようこそ", "WELCOME TO OBORO",
+      "Play your own PC's games on the New 3DS. The games run on your PC with Sunshine; the 3DS shows "
+      "the picture and sends your buttons.",
+      "You need Sunshine and Oboro Host on the PC, on the same Wi-Fi network." },
+    { "鍵", "ペアリング", "PAIR YOUR PC",
+      "Enter your PC's IP address once. A PIN appears here: type it on the PIN page of Sunshine on "
+      "the PC. No password is ever typed on the 3DS.",
+      "The pairing key stays only on this console's SD card." },
+    { "操", "操作", "CONTROLS",
+      "The 3DS plays like a PlayStation pad: bottom is Cross, right is Circle. L3, R3 and PS are on "
+      "the lower screen.",
+      "Hold START + SELECT during play for the stream menu." },
+    { "画", "画質", "PICTURE & WI-FI",
+      "Stay close to your router (3 bars). Balanced is the default; Sharp gives more detail on strong "
+      "Wi-Fi, Steady 1 Mbps helps if the picture stutters. ZOOM crops for small text.",
+      "Tap the stats tiles while playing to see your PC and this console." },
+    { "遊", "機能", "EXTRAS",
+      "Gyro aiming, screenshots, zoom zones, themes, favourites and options for each game. Open a "
+      "game from the library to see them.",
+      "Settings > System > Getting started shows this guide again." },
+};
+
+static void draw_guide_top(const App *app)
+{
+    const int page = app->guide_page < 0 ? 0 : app->guide_page;
+    const GuidePage *g = &GUIDE[page];
+    ui_enso(200, 78, 30, UI_ACCENT);
+    ui_text(200, 63, 30, UI_TEXT, UI_ALIGN_CENTER, g->kanji);
+    draw_title(200, 118, g->jp, g->en);
+    ui_text_wrap(200, 146, 12, UI_TEXT, UI_ALIGN_CENTER, 340, 4, 15, g->body);
+    ui_dots(200, 212, GUIDE_PAGES, (unsigned)page, UI_ACCENT, UI_LINE_STRONG);
+    static const char *const hints[] = { "A", "Next", "B", "Back", "START", "Skip", NULL };
+    ui_hint_row(200, 223, hints);
+}
+
+static void draw_guide_bottom(const App *app)
+{
+    const int page = app->guide_page < 0 ? 0 : app->guide_page;
+    ui_label(160, 8, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "GETTING STARTED");
+    ui_textf(160, 24, 12, UI_ACCENT, UI_ALIGN_CENTER, "%d / %d", page + 1, GUIDE_PAGES);
+    const UiRect card = { 16, 50, 288, 110 };
+    ui_panel(card, UI_ACCENT);
+    ui_label(160, card.y + 14, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "TIP");
+    ui_text_wrap(160, card.y + 34, 13, UI_TEXT, UI_ALIGN_CENTER, card.w - 28, 4, 17, GUIDE[page].tip);
+    ui_button(GUIDE_BACK, "BACK", "戻る", UI_BUTTON_NORMAL, pressed(app, GUIDE_BACK));
+    ui_button(GUIDE_SKIP, "SKIP", "省略", UI_BUTTON_NORMAL, pressed(app, GUIDE_SKIP));
+    const bool last = page == GUIDE_PAGES - 1;
+    ui_button(GUIDE_NEXT, last ? "START" : "NEXT", last ? "開始" : "次へ", UI_BUTTON_PRIMARY,
+              pressed(app, GUIDE_NEXT));
+}
+
+void screens_draw_top(const App *app)
+{
+    const float p = view_progress(&g_top_anim, (int)app->view, (int)app->modal);
+    const bool entering = p < 1.0f;
+    if (app->guide_page >= 0 && app->view != VIEW_STREAM) draw_mist(150, 0.35f);
+    else if (app->view == VIEW_WELCOME) draw_welcome_backdrop();
+    else if (app->view == VIEW_SESSION) draw_mist(132, 0.45f);
+    else if (app->view == VIEW_LOGIN) draw_mist(150, 0.35f);
+    draw_status_bar(app, UI_TOP_WIDTH);
+    /* The view's content rises 8 px as it fades in. */
+    ui_offset(0.0f, (1.0f - p) * 8.0f);
+    const bool menus = app->view != VIEW_STREAM;
+    const bool guide = app->guide_page >= 0 && menus;
+    if (app->whats_new_open && menus) draw_whats_new_top(app);
+    else if (guide) draw_guide_top(app);
+    else if (app->update_open && menus) draw_update_top(app);
+    else switch (app->view) {
+    case VIEW_WELCOME: draw_welcome_top(); break;
+    case VIEW_LOGIN: draw_login_top(app); break;
+    case VIEW_LIBRARY: draw_library_top(app, entering); break;
+    case VIEW_SETTINGS: draw_settings_top(app, entering); break;
+    case VIEW_SESSION: draw_session_top(app); break;
+    case VIEW_DETAILS:
+        if (app->mapping_open) draw_mapping_top(app);
+        else draw_details_top(app);
+        break;
+    case VIEW_STREAM: break;
+    }
+    ui_offset(0.0f, 0.0f);
+    fade_in_veil(UI_TOP_WIDTH, 26.0f, p);
+    if (app->modal != MODAL_NONE) draw_modal_top(app, overlay_progress(&g_top_anim));
+    if (app->busy) draw_busy_top(app);
+}
+
+/* ---- Bottom screens ------------------------------------------------------ */
+
+static void draw_welcome_bottom(const App *app)
+{
+    draw_status_strip(app, app->status);
+    ui_text(160, 40, 12, UI_TEXT, UI_ALIGN_CENTER, "Your own PC's games on the New 3DS.");
+    ui_text(160, 58, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, "Pair once with Sunshine on your PC:");
+    ui_text(160, 73, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, "enter its address, then a PIN.");
+    ui_button(WEL_SIGN_IN, "CONNECT TO PC", "接続", UI_BUTTON_PRIMARY, pressed(app, WEL_SIGN_IN));
+    ui_button(WEL_SETTINGS, "SETTINGS", "設定", UI_BUTTON_NORMAL, pressed(app, WEL_SETTINGS));
+    ui_button(WEL_EXIT, "EXIT", "終了", UI_BUTTON_NORMAL, pressed(app, WEL_EXIT));
+    ui_label(160, 222, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "VERSION " APP_VERSION);
+}
+
+static void draw_login_bottom(const App *app)
+{
+    draw_status_strip(app, app->status);
+    static const char *const steps[] = {
+        "Open the address above on your PC.",
+        "Log in to Sunshine if it asks.",
+        "Enter the PIN. This console continues",
+    };
+    for (int i = 0; i < 3; ++i) {
+        const float y = 40.0f + i * 34.0f;
+        ui_ring(30, y + 8, 9, 1.2f, UI_ACCENT, UI_BG);
+        ui_textf(30, y + 2, 11, UI_ACCENT, UI_ALIGN_CENTER, "%d", i + 1);
+        ui_text(48, y + 1, 12, UI_TEXT, UI_ALIGN_LEFT, steps[i]);
+        if (i < 2) ui_vline(30, y + 18, 16, UI_LINE);
+    }
+    ui_text(48, 123, 12, UI_TEXT, UI_ALIGN_LEFT, "on its own.");
+    /* Where the login lives, and who made this. */
+    ui_hline(16, 146, 288, UI_LINE);
+    ui_text_wrap(160, 152, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, 292, 2, 14,
+                 "The pairing key stays on this console's SD card only. Oboro is unofficial, not made by the Moonlight or Sunshine teams.");
+    ui_button(PAIR_LEFT, "NEW PIN", "再発行", UI_BUTTON_NORMAL, pressed(app, PAIR_LEFT));
+    ui_button(PAIR_RIGHT, "CANCEL", "取消", UI_BUTTON_NORMAL, pressed(app, PAIR_RIGHT));
+}
+
+static void draw_library_bottom(const App *app)
+{
+    const HostClient *client = app->client;
+    /* When idle, the strip says how fresh the saved library is. */
+    char synced[80];
+    const char *strip = app->status;
+    if (client->library_saved_at && !app->search_text[0]) {
+        const long age = (long)((int64_t)time(NULL) - client->library_saved_at);
+        if (age < 120) snprintf(synced, sizeof(synced), "%lu games · synced just now",
+                                (unsigned long)client->game_count);
+        else if (age < 7200) snprintf(synced, sizeof(synced), "%lu games · synced %ld min ago",
+                                      (unsigned long)client->game_count, age / 60);
+        else if (age < 172800) snprintf(synced, sizeof(synced), "%lu games · synced %ld h ago",
+                                        (unsigned long)client->game_count, age / 3600);
+        else snprintf(synced, sizeof(synced), "%lu games · synced %ld days ago",
+                      (unsigned long)client->game_count, age / 86400);
+        strip = synced;
+    }
+    draw_status_strip(app, strip);
+    const LibraryLayout *l = library_layout(app);
+    const bool compact = l == &LIB_COMPACT;
+    const bool has_game = app_game(app, app->selected) != NULL;
+    draw_arrow(l->prev, -1, has_game && app->selected > 0, pressed(app, l->prev));
+    draw_arrow(l->next, 1, has_game && app->selected + 1 < app->list_count, pressed(app, l->next));
+
+    const UiRect card = l->card;
+    ui_panel(card, UI_ACCENT);
+    if (has_game) {
+        const HostGame *game = app_game(app, app->selected);
+        /* Thumbnail on the left, text centred in the rest of the card. */
+        const float thumb = compact ? 42.0f : 48.0f;
+        draw_game_art(game, card.x + 8, card.y + (compact ? 7 : 10), thumb, 1.0f);
+        const float text_x = card.x + thumb + 16, text_w = card.w - thumb - 24, cx = text_x + text_w / 2;
+        const int lines = ui_text_wrap(cx, card.y + (compact ? 8 : 12), 14, UI_TEXT, UI_ALIGN_CENTER,
+                                       text_w, 2, 17, game->title);
+        const float meta_y = card.y + (compact ? 14 : 18) + lines * 17.0f;
+        ui_pill(cx, meta_y - 2, UI_TEXT_DIM, UI_ALIGN_CENTER, store_label(game->store));
+        if (!compact)
+            ui_text_fit(cx, meta_y + 17, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, text_w, stream_profile_name());
+    } else {
+        ui_text(160, card.y + 22, 13, UI_TEXT_DIM, UI_ALIGN_CENTER, "No game selected");
+        ui_text(160, card.y + 44, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "Load your library or search");
+    }
+
+    /* Open the game's page; an empty tab offers the full list instead. */
+    /* Continue: one tap (or START) back into the last game played. */
+    if (compact) {
+        const HostGame *last = &client->games[app->continue_index];
+        const UiRect c = l->cont;
+        const bool down = pressed(app, c);
+        ui_rect_r(c, down ? UI_ACCENT_DEEP : UI_SURFACE);
+        ui_outline(c.x, c.y, c.w, c.h, 1.0f, UI_ACCENT);
+        ui_triangle(c.x + 12, c.y + 9, c.x + 12, c.y + 21, c.x + 21, c.y + 15, UI_ACCENT);
+        ui_label(c.x + 28, c.y + 9, 11, UI_ACCENT, UI_ALIGN_LEFT, "CONTINUE");
+        const float label_w = ui_text_width("CONTINUE", 11) + 9.0f, gap = 8;
+        ui_text_fit(c.x + 28 + label_w + gap, c.y + 7, 13, UI_TEXT, UI_ALIGN_LEFT,
+                    c.w - 28 - label_w - gap - 54, last->title);
+        ui_button_chip(c.x + c.w - 50, c.y + 7, "START", UI_TEXT_DIM);
+    }
+    const char *main_label = has_game ? "OPEN GAME" : client->game_count ? "SHOW ALL GAMES" : "LOAD LIBRARY";
+    const char *main_jp = has_game ? "詳細" : client->game_count ? "全て" : "ライブラリ";
+    ui_button(l->play, main_label, main_jp, has_game ? UI_BUTTON_PRIMARY : UI_BUTTON_NORMAL,
+              pressed(app, l->play));
+    /* In the library this button refreshes it; after a search it goes back. */
+    const bool searching = app->search_text[0] != '\0';
+    ui_button(l->library, searching ? "LIBRARY" : "REFRESH", searching ? "ライブラリ" : "更新",
+              UI_BUTTON_NORMAL, pressed(app, l->library));
+    ui_button(l->search, "SEARCH", "検索",
+              app->search_text[0] ? UI_BUTTON_ACTIVE : UI_BUTTON_NORMAL, pressed(app, l->search));
+    ui_button(l->settings, "SETTINGS", "設定", UI_BUTTON_NORMAL, pressed(app, l->settings));
+}
+
+/* PlayStation symbol produced by a 3DS face button in the current layout.
+ * key: 0 X (top), 1 A (right), 2 B (bottom), 3 Y (left). */
+static void draw_ps_symbol_for_key(int key, bool position_layout, float cx, float cy, float size)
+{
+    static const int by_position[4] = { 0, 1, 2, 3 };
+    static const int by_letter[4] = { 3, 2, 1, 0 };
+    switch (position_layout ? by_position[key] : by_letter[key]) {
+    case 0: ui_ps_triangle(cx, cy, size, UI_MATCHA); break;
+    case 1: ui_ps_circle(cx, cy, size, UI_DANGER); break;
+    case 2: ui_ps_cross(cx, cy, size, UI_AI); break;
+    default: ui_ps_square(cx, cy, size, UI_SAKURA); break;
+    }
+}
+
+static void draw_face_diamond(float cx, float cy, bool playstation, bool position_layout)
+{
+    const float d = 17.0f, r = 10.0f;
+    /* Order: top, right, bottom, left. */
+    const float px[4] = { cx, cx + d, cx, cx - d };
+    const float py[4] = { cy - d, cy, cy + d, cy };
+    static const char *const letters[4] = { "X", "A", "B", "Y" };
+    for (int i = 0; i < 4; ++i) {
+        ui_ring(px[i], py[i], r, 1.2f, UI_LINE_STRONG, UI_SURFACE);
+        if (playstation) draw_ps_symbol_for_key(i, position_layout, px[i], py[i], 11);
+        else ui_text(px[i], py[i] - 6.5f, 12, UI_TEXT, UI_ALIGN_CENTER, letters[i]);
+    }
+}
+
+/* A console tilting back and forth: the gyro preview. */
+static void draw_gyro_preview(const App *app)
+{
+    const bool on = app->settings.gyro_mode != HOST_GYRO_OFF;
+    const float t = (float)ui_ticks() / 1000.0f;
+    const float sway = on ? sinf(t * 2.2f) * 10.0f : 0.0f;
+    const float cx = 160 + sway, cy = 118;
+    ui_rounded(cx - 34, cy - 20, 68, 40, 6, on ? UI_ACCENT : UI_LINE_STRONG);
+    ui_rounded(cx - 32, cy - 18, 64, 36, 5, UI_SURFACE);
+    ui_rect(cx - 20, cy - 12, 40, 24, on ? UI_ACCENT_DEEP : UI_BG);
+    ui_circle(cx - 26, cy - 6, 3, UI_LINE_STRONG);
+    for (int side = -1; side <= 1; side += 2) {
+        const float ax = 160 + side * 58.0f;
+        ui_triangle(ax, cy - 6, ax, cy + 6, ax + side * 8.0f, cy, on ? UI_ACCENT : UI_LINE_STRONG);
+    }
+    if (app->settings.gyro_mode == HOST_GYRO_WHILE_AIMING)
+        ui_label(160, cy + 28, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER,
+                 app->settings.swap_shoulders ? "HOLD L TO AIM" : "HOLD ZL TO AIM");
+}
+
+/* Smooth <-> sharp meter for the bitrate choice. */
+static void draw_bitrate_preview(const App *app)
+{
+    const float x0 = 60, x1 = 260, y = 124;
+    ui_hline(x0, y, x1 - x0, UI_LINE_STRONG);
+    ui_label(x0, y + 8, 11, UI_TEXT_FAINT, UI_ALIGN_LEFT, "SMOOTH");
+    ui_label(x1, y + 8, 11, UI_TEXT_FAINT, UI_ALIGN_RIGHT, "SHARP");
+    /* Positions by rate: 1 Mbps at the left, Sharp (~1.8-2) at the right. */
+    static const float stops[STREAM_BITRATE_COUNT] = { 0.4f, 0.0f, 0.25f, 0.6f, 1.0f };
+    for (int i = 1; i < STREAM_BITRATE_COUNT; ++i)
+        ui_circle(x0 + (x1 - x0) * stops[i], y, 2.0f, UI_LINE_STRONG);
+    const float at = x0 + (x1 - x0) * stops[app->settings.bitrate_mode];
+    ui_circle(at, y, 6.0f, UI_ACCENT);
+    ui_circle(at, y, 2.5f, UI_BG);
+    if (app->settings.bitrate_mode == STREAM_BITRATE_ADAPTIVE)
+        ui_rect(x0 + (x1 - x0) * 0.4f, y - 1, (x1 - x0) * 0.4f, 2, ui_with_alpha(UI_ACCENT, 0x70));
+}
+
+static void draw_settings_bottom(const App *app)
+{
+    const int setting = screens_setting_at(app->setting_index);
+    ui_text(160, 2, 12, UI_ACCENT, UI_ALIGN_CENTER, SETTING_JP[setting]);
+    ui_label(160, 16, 11, UI_TEXT, UI_ALIGN_CENTER, SETTING_LABELS[setting]);
+    ui_hline(0, 29, UI_BOTTOM_WIDTH, UI_LINE);
+    ui_text_wrap(160, 36, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, 292, 3, 14,
+                 setting_description(app, setting));
+
+    const bool account = setting == SETTING_ACCOUNT;
+    if (setting == SETTING_LAYOUT || setting == SETTING_TRIGGERS) {
+        const bool position = app->settings.button_layout == HOST_LAYOUT_POSITION;
+        draw_face_diamond(96, 116, false, position);
+        draw_face_diamond(224, 116, true, position);
+        ui_triangle(152, 110, 152, 122, 164, 116, UI_ACCENT);
+        ui_label(96, 146, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "3DS");
+        ui_label(224, 146, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "PLAYSTATION");
+        const bool swap = app->settings.swap_shoulders;
+        ui_textf(160, 163, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, "L  %s     ZL  %s     R  %s     ZR  %s",
+                 swap ? "L2" : "L1", swap ? "L1" : "L2", swap ? "R2" : "R1", swap ? "R1" : "R2");
+    } else {
+        const float value_y = setting == SETTING_GYRO || setting == SETTING_BITRATE ? 146.0f : 104.0f;
+        if (setting == SETTING_GYRO) draw_gyro_preview(app);
+        if (setting == SETTING_THEME) {
+            for (int i = 0; i < UI_THEME_COUNT; ++i) {
+                const float sx = 160 + (i - 2) * 34.0f;
+                const bool on = (unsigned)i == app->settings.theme;
+                if (on) ui_ring(sx, 88, 13, 1.5f, UI_TEXT, UI_BG);
+                ui_circle(sx, 88, 9, ui_theme_color((UiTheme)i));
+            }
+        }
+        if (setting == SETTING_BITRATE) draw_bitrate_preview(app);
+        ui_text(160, value_y, setting == SETTING_GYRO || setting == SETTING_BITRATE ? 16 : 22,
+                account ? UI_DANGER : UI_TEXT, UI_ALIGN_CENTER, setting_value(app, setting));
+        unsigned count = 0;
+        const unsigned option = setting_option(app, setting, &count);
+        if (count > 1 && setting != SETTING_BITRATE)
+            ui_dots(160, value_y + (setting == SETTING_GYRO ? 24.0f : 34.0f), count, option,
+                    UI_ACCENT, UI_LINE_STRONG);
+    }
+
+    const bool arrows = !account;
+    draw_arrow(SET_PREV, -1, arrows, pressed(app, SET_PREV));
+    draw_arrow(SET_NEXT, 1, arrows, pressed(app, SET_NEXT));
+    const bool sign_out = account && host_has_session(app->client);
+    ui_button(SET_BACK, sign_out ? "FORGET PC" : "BACK", sign_out ? "解除" : "戻る",
+              sign_out ? UI_BUTTON_DANGER : UI_BUTTON_NORMAL, pressed(app, SET_BACK));
+}
+
+static void draw_session_bottom(const App *app)
+{
+    const HostClient *client = app->client;
+    draw_status_strip(app, app->status);
+    const UiRect card = { 16, 34, 288, 70 };
+    ui_panel(card, UI_ACCENT);
+    const bool art = app->current_game && app->current_game->app_id[0];
+    if (art) draw_game_art(app->current_game, card.x + 8, card.y + 7, 42, 1.0f);
+    const float text_x = art ? card.x + 58 : card.x + 10, text_w = art ? card.w - 66 : card.w - 20;
+    ui_text_wrap(text_x + text_w / 2, card.y + 12, 14, UI_TEXT, UI_ALIGN_CENTER, text_w, 2, 17,
+                 app->game_title[0] ? app->game_title : "Your PC");
+    ui_text_fit(text_x + text_w / 2, card.y + 50, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, text_w,
+                stream_profile_name());
+
+    /* Two symmetric facts under the card. */
+    ui_label(88, 116, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "WI-FI");
+    ui_wifi_icon(70, 133, app->wifi_bars, UI_ACCENT, UI_LINE_STRONG);
+    ui_textf(96, 131, 15, UI_TEXT, UI_ALIGN_LEFT, "%u/3", app->wifi_bars);
+    ui_vline(160, 116, 34, UI_LINE);
+    ui_label(232, 116, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "PC");
+    ui_text_fit(232, 131, 15, UI_TEXT, UI_ALIGN_CENTER, 130, client->address);
+    if (app->wifi_bars < 2)
+        ui_text(160, 160, 11, UI_KIN, UI_ALIGN_CENTER, "Weak Wi-Fi: move closer to the router.");
+
+    if (session_failed(app) && !app->waiting_wifi && (app->reconnect_attempt == 0 || app->reconnect_attempt > 3)) {
+        ui_button(PAIR_LEFT, "RETRY", "再試行", UI_BUTTON_PRIMARY, pressed(app, PAIR_LEFT));
+        ui_button(PAIR_RIGHT, "LEAVE", "退出", UI_BUTTON_DANGER, pressed(app, PAIR_RIGHT));
+    } else {
+        ui_button(SINGLE, "LEAVE", "退出", UI_BUTTON_DANGER, pressed(app, SINGLE));
+    }
+}
+
+static void draw_zoom_map(void)
+{
+    const UiRect frame = { STR_PANEL.x + 4, STR_PANEL.y + 6, STR_PANEL.w - 8, (STR_PANEL.w - 8) * 9 / 16 };
+    ui_rect_r(frame, UI_SURFACE);
+    ui_outline(frame.x, frame.y, frame.w, frame.h, 1.0f, UI_LINE_STRONG);
+    const unsigned level = mvd_video_zoom_level();
+    const float fraction = level == 1 ? 0.833f : level == 2 ? 0.667f : 0.5f;
+    unsigned px = 50, py = 50;
+    mvd_video_zoom_position(&px, &py);
+    const float vw = frame.w * fraction, vh = frame.h * fraction;
+    float vx = frame.x + frame.w * px / 100.0f - vw / 2;
+    float vy = frame.y + frame.h * py / 100.0f - vh / 2;
+    if (vx < frame.x) vx = frame.x;
+    if (vy < frame.y) vy = frame.y;
+    if (vx + vw > frame.x + frame.w) vx = frame.x + frame.w - vw;
+    if (vy + vh > frame.y + frame.h) vy = frame.y + frame.h - vh;
+    ui_rect(vx, vy, vw, vh, ui_with_alpha(UI_ACCENT, 0x30));
+    ui_outline(vx, vy, vw, vh, 1.5f, UI_ACCENT);
+    ui_label(160, frame.y + frame.h + 4, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, "DRAG TO MOVE THE VIEW");
+}
+
+static void draw_touchpad(void)
+{
+    const UiRect p = STR_PANEL;
+    ui_rect_r(p, UI_SURFACE);
+    /* Dashed border. */
+    for (float x = p.x; x < p.x + p.w; x += 8) {
+        ui_rect(x, p.y, 4, 1, UI_LINE_STRONG);
+        ui_rect(x, p.y + p.h - 1, 4, 1, UI_LINE_STRONG);
+    }
+    for (float y = p.y; y < p.y + p.h; y += 8) {
+        ui_rect(p.x, y, 1, 4, UI_LINE_STRONG);
+        ui_rect(p.x + p.w - 1, y, 1, 4, UI_LINE_STRONG);
+    }
+    ui_text(160, p.y + 30, 12, UI_ACCENT, UI_ALIGN_CENTER, "タッチパッド");
+    ui_label(160, p.y + 48, 11, UI_TEXT, UI_ALIGN_CENTER, "TOUCHPAD");
+    ui_text(160, p.y + 66, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, "Drag to move, tap to click");
+    ui_text(160, p.y + 81, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, "C-Stick moves, A clicks");
+}
+
+/* Four tiles a page; a tap turns the page (handle_stream in main.c):
+ * the stream, the PC, more of the PC, this console. */
+typedef struct {
+    const char *label;
+    char value[16];
+    bool warn;
+} StatTile;
+
+static void stat_tile(StatTile *tile, const char *label, bool warn, const char *format, ...)
+    __attribute__((format(printf, 4, 5)));
+static void stat_tile(StatTile *tile, const char *label, bool warn, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vsnprintf(tile->value, sizeof(tile->value), format, args);
+    va_end(args);
+    tile->label = label;
+    tile->warn = warn;
+}
+
+/* A value the PC could not measure (or no answer yet) shows a dash. */
+static void stat_tile_optional(StatTile *tile, const char *label, int value, bool warn)
+{
+    if (value >= 0) stat_tile(tile, label, warn, "%d", value);
+    else stat_tile(tile, label, false, "-");
+}
+
+static void draw_stats(const App *app)
+{
+    const MoonTransport *t = app->transport;
+    const UiRect p = STR_PANEL;
+    if (!app->settings.show_stats) {
+        ui_panel(p, UI_ACCENT);
+        ui_text_wrap(160, p.y + 26, 14, UI_TEXT, UI_ALIGN_CENTER, p.w - 16, 2, 17, app->game_title);
+        ui_label(160, p.y + 78, 11, UI_TEXT_DIM, UI_ALIGN_CENTER,
+                 app->settings.button_layout == HOST_LAYOUT_POSITION ? "POSITION LAYOUT" : "LETTER LAYOUT");
+        return;
+    }
+    StatTile tiles[4];
+    PcStats pc = pc_stats_get();
+    /* No answer from the PC's companion script: every PC value is unknown. */
+    if (!pc.valid) pc.cpu = pc.gpu = pc.ram = pc.vram = pc.gpu_temp = pc.fps = -1;
+    switch (app->stats_page) {
+    case STATS_PAGE_PC:
+        stat_tile_optional(&tiles[0], "PC CPU %", pc.cpu, pc.cpu > 90);
+        stat_tile_optional(&tiles[1], "PC GPU %", pc.gpu, false);
+        stat_tile_optional(&tiles[2], "PC RAM %", pc.ram, pc.ram > 90);
+        stat_tile_optional(&tiles[3], "GPU TEMP", pc.gpu_temp, pc.gpu_temp > 85);
+        break;
+    case STATS_PAGE_PC_MORE:
+        stat_tile_optional(&tiles[0], "GAME FPS", pc.fps, false);
+        stat_tile_optional(&tiles[1], "VRAM %", pc.vram, pc.vram > 95);
+        /* The PC's capture-to-encode time, reported with each frame. */
+        if (t->host_latency) stat_tile(&tiles[2], "ENCODE MS", false, "%.1f", t->host_latency / 10.0f);
+        else stat_tile(&tiles[2], "ENCODE MS", false, "-");
+        stat_tile(&tiles[3], "SENT FPS", t->video_fps > 0 && t->video_fps < 24, "%u", t->video_fps);
+        break;
+    case STATS_PAGE_CONSOLE: {
+        unsigned long long decode_sum = 0;
+        unsigned decode_count = 0, decode_max = 0;
+        mvd_video_decode_totals(&decode_sum, &decode_count, &decode_max, false);
+        if (app->battery_percent >= 0)
+            stat_tile(&tiles[0], "BATTERY %", app->battery_percent <= 15 && !app->charging, "%d%s",
+                      app->battery_percent, app->charging ? "+" : "");
+        else
+            stat_tile(&tiles[0], "BATTERY", app->battery_level <= 1 && !app->charging, "%u/5", app->battery_level);
+        stat_tile(&tiles[1], "WI-FI", app->wifi_bars < 2, "%u/3", app->wifi_bars);
+        /* What the Wi-Fi link is carrying right now. */
+        stat_tile(&tiles[2], "WIFI MBPS", false, "%.1f", t->video_kbps / 1000.0f);
+        stat_tile(&tiles[3], "DECODE MS", false, "%.1f",
+                  decode_count ? (float)decode_sum / (float)decode_count / 1000.0f : 0.0f);
+        break;
+    }
+    default:
+        stat_tile(&tiles[0], "FPS", app->fps > 0 && app->fps < 24, "%u", app->fps);
+        stat_tile(&tiles[1], "MBPS", false, "%.1f", t->video_kbps / 1000.0f);
+        stat_tile(&tiles[2], "PING MS", t->rtt_ms > 80, "%d", t->rtt_ms);
+        /* Packets lost on the way and rebuilt from error correction. */
+        stat_tile(&tiles[3], "FEC/S", app->resent_per_second > 2, "%u", app->resent_per_second);
+        break;
+    }
+    /* The page dots take the bottom strip of the panel. */
+    const float dots_h = 10.0f;
+    const float tw = (p.w - 4) / 2, th = (p.h - dots_h - 4) / 2;
+    for (int i = 0; i < 4; ++i) {
+        const float x = p.x + (i % 2) * (tw + 4), y = p.y + (i / 2) * (th + 4);
+        const bool warn = tiles[i].warn;
+        ui_rect(x, y, tw, th, UI_SURFACE);
+        ui_outline(x, y, tw, th, 1.0f, warn ? UI_KIN : UI_LINE);
+        ui_rect(x, y + th - 2, tw, 2, warn ? UI_KIN : UI_ACCENT_DEEP);
+        ui_text(x + tw / 2, y + 6, 20, warn ? UI_KIN : UI_TEXT, UI_ALIGN_CENTER, tiles[i].value);
+        ui_label(x + tw / 2, y + th - 16, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, tiles[i].label);
+    }
+    ui_dots(160, p.y + p.h - dots_h / 2 + 1, STATS_PAGES, (unsigned)app->stats_page, UI_ACCENT, UI_LINE_STRONG);
+}
+
+static void draw_stick_button(UiRect r, const char *label, const char *jp, bool is_pressed)
+{
+    ui_rect_r(r, is_pressed ? UI_ACCENT : UI_BG);
+    ui_outline(r.x, r.y, r.w, r.h, 1.0f, is_pressed ? UI_ACCENT : UI_LINE_STRONG);
+    const float cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    ui_ring(cx, cy - 8, 16, 1.2f, is_pressed ? UI_BG : UI_LINE_STRONG, is_pressed ? UI_ACCENT : UI_BG);
+    ui_text(cx, cy - 16, 15, is_pressed ? UI_BG : UI_TEXT, UI_ALIGN_CENTER, label);
+    ui_text(cx, cy + 16, 12, is_pressed ? UI_BG : UI_TEXT_FAINT, UI_ALIGN_CENTER, jp);
+}
+
+static void draw_stream_menu(const App *app, float p)
+{
+    ui_rect(0, 0, UI_BOTTOM_WIDTH, UI_HEIGHT, ui_with_alpha(UI_BG, (u8)(0xC8 * p)));
+    ui_offset(0.0f, (1.0f - p) * 10.0f);
+    draw_card(MENU_PANEL, p);
+    ui_text(160, MENU_PANEL.y + 8, 12, UI_ACCENT, UI_ALIGN_CENTER, "一時停止");
+    ui_label(160, MENU_PANEL.y + 23, 11, UI_TEXT, UI_ALIGN_CENTER, "STREAM MENU");
+    const char *layout = app->settings.button_layout == HOST_LAYOUT_POSITION ? "LAYOUT: POS" : "LAYOUT: ABC";
+    const char *gyro = app->settings.gyro_mode == HOST_GYRO_ALWAYS ? "GYRO: ON" :
+                       app->settings.gyro_mode == HOST_GYRO_WHILE_AIMING ? "GYRO: AIM" : "GYRO: OFF";
+    const char *zone = mvd_video_zoomed() ? "SAVE ZONE" : zoom_zones_count() ? "CLEAR ZONES" : "SAVE ZONE";
+    const char *labels[STREAM_MENU_COUNT] = {
+        "RESUME", "SCREENSHOT", "CONTROLS", zone, gyro,
+        app->sound_muted ? "SOUND: OFF" : "SOUND: ON", layout, "DISCONNECT"
+    };
+    static const char *const jp[STREAM_MENU_COUNT] = {
+        "再開", "撮影", "操作", "ズーム", "ジャイロ", "音声", "ボタン配置", "切断"
+    };
+    for (int i = 0; i < STREAM_MENU_COUNT; ++i) {
+        const UiRect r = menu_item(i);
+        const bool focus = i == app->stream_menu_index;
+        const UiButtonStyle style = i == STREAM_MENU_DISCONNECT ? UI_BUTTON_DANGER :
+                                    i == STREAM_MENU_RESUME ? UI_BUTTON_PRIMARY :
+                                    focus ? UI_BUTTON_ACTIVE : UI_BUTTON_NORMAL;
+        ui_button(r, labels[i], jp[i], style, pressed(app, r));
+        if (focus) ui_outline(r.x - 3, r.y - 3, r.w + 6, r.h + 6, 1.5f, UI_ACCENT);
+    }
+    ui_offset(0.0f, 0.0f);
+}
+
+/* One line of the controls sheet: a 3DS input on the left, what it does. */
+static void controls_row(float y, const char *input, const char *action)
+{
+    const float chip_w = ui_button_chip(24, y, input, UI_TEXT_DIM);
+    (void)chip_w;
+    ui_text(132, y + 1, 12, UI_TEXT, UI_ALIGN_LEFT, action);
+}
+
+static void draw_controls_sheet(const App *app, float p)
+{
+    ui_rect(0, 0, UI_BOTTOM_WIDTH, UI_HEIGHT, ui_with_alpha(UI_BG, (u8)(0xF0 * p)));
+    ui_offset(0.0f, (1.0f - p) * 10.0f);
+    ui_text(160, 4, 12, UI_ACCENT, UI_ALIGN_CENTER, "操作");
+    ui_label(160, 18, 11, UI_TEXT, UI_ALIGN_CENTER, "CONTROLS");
+    ui_hline(16, 33, 288, UI_LINE);
+
+    const AppSettings *s = &app->settings;
+    const bool position = s->button_layout == HOST_LAYOUT_POSITION;
+    /* Face buttons with the PlayStation symbol each one sends. */
+    static const char *const keys[4] = { "X", "A", "B", "Y" };
+    float x = 26;
+    for (int i = 0; i < 4; ++i) {
+        ui_button_chip(x, 40, keys[i], UI_TEXT_DIM);
+        draw_ps_symbol_for_key(i, position, x + 28, 47.5f, 11);
+        x += 72;
+    }
+    float y = 64;
+    const float dy = 17;
+    controls_row(y, "CIRCLE", "Left stick"); y += dy;
+    controls_row(y, "C-STICK", s->gyro_mode != HOST_GYRO_OFF ? "Right stick + gyro" : "Right stick"); y += dy;
+    controls_row(y, s->swap_shoulders ? "ZL ZR" : "L R", "L1 / R1"); y += dy;
+    controls_row(y, s->swap_shoulders ? "L R" : "ZL ZR", "L2 / R2 triggers"); y += dy;
+    controls_row(y, "START", "Options"); y += dy;
+    controls_row(y, "SELECT", "Share / View"); y += dy;
+    controls_row(y, "TOUCH", "L3 / R3 / PS buttons"); y += dy;
+    controls_row(y, "START+SELECT", "Hold for the stream menu"); y += dy;
+    if (host_input_custom_map_active())
+        ui_text(160, y + 4, 11, UI_ACCENT, UI_ALIGN_CENTER, "This game uses its own button mapping (Options)");
+    else
+        ui_textf(160, y + 4, 11, UI_TEXT_FAINT, UI_ALIGN_CENTER, "Gyro aim: %s  ·  change it in the stream menu",
+                 gyro_mode_name(s->gyro_mode));
+    static const char *const hints[] = { "B", "Close", NULL };
+    ui_hint_row(160, 222, hints);
+    ui_offset(0.0f, 0.0f);
+}
+
+static void format_elapsed(char *out, size_t size, u64 ms)
+{
+    const unsigned total = (unsigned)(ms / 1000);
+    if (total >= 3600)
+        snprintf(out, size, "%u:%02u:%02u", total / 3600, total / 60 % 60, total % 60);
+    else
+        snprintf(out, size, "%u:%02u", total / 60, total % 60);
+}
+
+static void draw_stream_header(const App *app)
+{
+    const MoonTransport *t = app->transport;
+    const u64 now = osGetTime();
+    const u64 elapsed = app->stream_started_at ? now - app->stream_started_at : 0;
+    if (app->video_stalled) {
+        ui_rect(0, 0, UI_BOTTOM_WIDTH, 23, UI_KIN);
+        ui_text(160, 5, 11, UI_BG, UI_ALIGN_CENTER, "Connection unstable - waiting for video");
+        return;
+    }
+    if (app->toast) {
+        ui_rect(0, 0, UI_BOTTOM_WIDTH, 23, UI_ACCENT_DEEP);
+        ui_text_fit(160, 5, 11, UI_TEXT, UI_ALIGN_CENTER, 296, app->toast);
+        ui_hline(0, 23, UI_BOTTOM_WIDTH, UI_ACCENT);
+        return;
+    }
+    ui_circle(12, 11, 3.5f, t->input_ready ? UI_ACCENT : UI_KIN);
+    ui_text(20, 4, 12, UI_ACCENT, UI_ALIGN_LEFT, "配信");
+    /* For the first seconds, teach the menu shortcut instead of the title. */
+    if (app->stream_started_at && elapsed < 7000)
+        ui_text_fit(160, 5, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, 190, "Hold START + SELECT for the menu");
+    else
+        ui_text_fit(160, 5, 11, UI_TEXT, UI_ALIGN_CENTER, 190, app->game_title);
+    char timer[24];
+    format_elapsed(timer, sizeof(timer), elapsed);
+    ui_text(308, 5, 11, UI_TEXT_DIM, UI_ALIGN_RIGHT, timer);
+    ui_hline(0, 23, UI_BOTTOM_WIDTH, UI_LINE);
+}
+
+static void draw_welcome_back(const App *app);
+
+static void draw_stream_bottom(const App *app, float overlay_p)
+{
+    const MoonTransport *t = app->transport;
+    if (app->keyboard_open) {
+        remote_keyboard_draw(t, app->touching, app->touch_x, app->touch_y);
+        return;
+    }
+    draw_stream_header(app);
+
+    const uint16_t held = app->touching ? screens_stream_held_buttons(app, app->touch_x, app->touch_y) : 0;
+    draw_stick_button(STR_L3, "L3", "左", (held & HOST_PAD_LEFT_THUMB) != 0);
+    draw_stick_button(STR_R3, "R3", "右", (held & HOST_PAD_RIGHT_THUMB) != 0);
+
+    if (t->pointer_mode) draw_touchpad();
+    else if (mvd_video_zoomed()) draw_zoom_map();
+    else draw_stats(app);
+
+    /* Guide / PS button, centred between the stick buttons. */
+    const bool guide = (held & HOST_PAD_GUIDE) != 0;
+    const float gx = STR_GUIDE.x + STR_GUIDE.w / 2, gy = STR_GUIDE.y + STR_GUIDE.h / 2;
+    ui_ring(gx, gy, 17, 1.5f, guide ? UI_ACCENT : UI_LINE_STRONG, guide ? UI_ACCENT : UI_BG);
+    ui_text(gx, gy - 7, 12, guide ? UI_BG : UI_TEXT, UI_ALIGN_CENTER, "PS");
+    ui_hline(STR_L3.x + STR_L3.w + 6, gy, gx - 17 - (STR_L3.x + STR_L3.w + 6) - 4, UI_LINE);
+    ui_hline(gx + 21, gy, STR_R3.x - 6 - (gx + 21), UI_LINE);
+    if (app->settings.gyro_mode != HOST_GYRO_OFF) {
+        /* Gyro badge on the left rule, lit while gyro is steering. */
+        const bool live = host_input_gyro_active();
+        ui_rect(78, gy - 8, 44, 16, UI_BG);
+        ui_label(100, gy - 6, 11, live ? UI_ACCENT : UI_TEXT_FAINT, UI_ALIGN_CENTER, "GYRO");
+    }
+
+    char zoom[16];
+    const unsigned level = mvd_video_zoom_level();
+    if (app->zone_index >= 0 && level) snprintf(zoom, sizeof(zoom), "ZONE %d", app->zone_index + 1);
+    else snprintf(zoom, sizeof(zoom), "%s", level == 3 ? "2.0x" : level == 2 ? "1.5x" : level == 1 ? "1.2x" : "拡大");
+    const char *labels[4] = { "KEYS", "POINTER", "ZOOM", "MENU" };
+    const char *jp[4] = { "キー", "ポインタ", zoom, "メニュー" };
+    const bool active[4] = { false, t->pointer_mode, level != 0, false };
+    for (int i = 0; i < 4; ++i) {
+        const UiRect r = stream_button(i);
+        ui_button(r, labels[i], jp[i], active[i] ? UI_BUTTON_ACTIVE : UI_BUTTON_NORMAL, pressed(app, r));
+    }
+    if (app->controls_open) draw_controls_sheet(app, overlay_p);
+    else if (app->stream_menu) draw_stream_menu(app, overlay_p);
+    else draw_welcome_back(app);
+}
+
+/* After a lid pause: a short card over the lower screen's panel. */
+#define WELCOME_MS 3200
+static bool welcome_visible(const App *app)
+{
+    return app->welcome_at && osGetTime() - app->welcome_at < WELCOME_MS;
+}
+
+static void draw_welcome_back(const App *app)
+{
+    if (!welcome_visible(app)) return;
+    const u64 t = osGetTime() - app->welcome_at;
+    float a = 1.0f;
+    if (t < 250) a = t / 250.0f;
+    else if (t > WELCOME_MS - 500) a = (WELCOME_MS - t) / 500.0f;
+    const float e = ui_ease_out(a);
+    const u8 alpha = (u8)(0xFF * e);
+    const UiRect p = STR_PANEL;
+    ui_offset(0.0f, (1.0f - e) * 6.0f);
+    ui_rect(p.x, p.y, p.w, p.h, ui_with_alpha(UI_BG, (u8)(0xF0 * e)));
+    ui_outline(p.x, p.y, p.w, p.h, 1.0f, ui_with_alpha(UI_ACCENT, alpha));
+    ui_enso(160, p.y + 26, 15, ui_with_alpha(UI_ACCENT, alpha));
+    ui_text(160, p.y + 48, 15, ui_with_alpha(UI_ACCENT, alpha), UI_ALIGN_CENTER, "おかえり");
+    ui_label(160, p.y + 67, 11, ui_with_alpha(UI_TEXT, alpha), UI_ALIGN_CENTER, "WELCOME BACK");
+    char away[48];
+    if (app->welcome_away_s >= 90)
+        snprintf(away, sizeof(away), "Paused %u min · still connected", (app->welcome_away_s + 30) / 60);
+    else
+        snprintf(away, sizeof(away), "Paused %u s · still connected", app->welcome_away_s);
+    ui_text(160, p.y + 83, 11, ui_with_alpha(UI_TEXT_DIM, alpha), UI_ALIGN_CENTER, away);
+    ui_offset(0.0f, 0.0f);
+}
+
+static void draw_modal_bottom(const App *app, float p)
+{
+    ui_rect(0, 0, UI_BOTTOM_WIDTH, UI_HEIGHT, ui_with_alpha(UI_BG, (u8)(0xC8 * p)));
+    ui_offset(0.0f, (1.0f - p) * 10.0f);
+    ui_text(160, 68, 12, UI_ACCENT, UI_ALIGN_CENTER, app->modal_jp);
+    ui_label(160, 84, 11, UI_TEXT, UI_ALIGN_CENTER, app->modal_title);
+    const bool error = app->modal == MODAL_ERROR;
+    if (app->modal == MODAL_REPORT_SENT) {
+        ui_text(160, 104, 22, UI_TEXT, UI_ALIGN_CENTER, app->report_code);
+        ui_button(MODAL_LEFT, "OK", "了解", UI_BUTTON_PRIMARY, pressed(app, MODAL_LEFT));
+        ui_offset(0.0f, 0.0f);
+        return;
+    }
+    const bool send = app->modal == MODAL_SEND_REPORT, share = app->modal == MODAL_SHARE_ASK;
+    if (app->modal == MODAL_CONFLICT) {
+        ui_button(MODAL_LEFT, "QUIT IT", "終了", UI_BUTTON_DANGER, pressed(app, MODAL_LEFT));
+        ui_button(MODAL_RIGHT, "BACK", "戻る", UI_BUTTON_NORMAL, pressed(app, MODAL_RIGHT));
+        ui_offset(0.0f, 0.0f);
+        return;
+    }
+    ui_button(MODAL_LEFT, error ? "RETRY" : send ? "SEND" : share ? "SHARE" : "YES",
+              error ? "再試行" : send ? "送信" : share ? "協力" : "はい",
+              app->modal == MODAL_EXIT || app->modal == MODAL_SIGN_OUT ? UI_BUTTON_DANGER
+                                                                         : UI_BUTTON_PRIMARY,
+              pressed(app, MODAL_LEFT));
+    ui_button(MODAL_RIGHT, error ? "BACK" : send ? "CANCEL" : share ? "NO THANKS" : "NO",
+              error ? "戻る" : send ? "取消" : share ? "不要" : "いいえ",
+              UI_BUTTON_NORMAL, pressed(app, MODAL_RIGHT));
+    ui_offset(0.0f, 0.0f);
+}
+
+void screens_draw_bottom(const App *app)
+{
+    /* The overlay id folds the modal, menu and controls sheet together so
+     * any of them opening restarts the overlay fade. */
+    const int overlay = app->modal != MODAL_NONE ? 10 + (int)app->modal :
+                        app->controls_open ? 2 : app->stream_menu ? 1 : app->options_open ? 3 : 0;
+    const float p = view_progress(&g_bottom_anim, (int)app->view, overlay);
+    const float op = overlay_progress(&g_bottom_anim);
+    g_bottom_busy_animating = p < 1.0f || (overlay && op < 1.0f) || welcome_visible(app) ||
+                              (app->view == VIEW_SETTINGS && app->setting_index >= 0 &&
+                               (screens_setting_at(app->setting_index) == SETTING_GYRO));
+    ui_offset(0.0f, (1.0f - p) * 8.0f);
+    const bool menus = app->view != VIEW_STREAM;
+    const bool guide = app->guide_page >= 0 && menus;
+    if (app->whats_new_open && menus) draw_whats_new_bottom(app);
+    else if (guide) draw_guide_bottom(app);
+    else if (app->update_open && menus) draw_update_bottom(app);
+    else switch (app->view) {
+    case VIEW_WELCOME: draw_welcome_bottom(app); break;
+    case VIEW_LOGIN: draw_login_bottom(app); break;
+    case VIEW_LIBRARY: draw_library_bottom(app); break;
+    case VIEW_SETTINGS: draw_settings_bottom(app); break;
+    case VIEW_SESSION: draw_session_bottom(app); break;
+    case VIEW_DETAILS: draw_details_bottom(app, op); break;
+    case VIEW_STREAM: ui_offset(0.0f, 0.0f); draw_stream_bottom(app, op); break;
+    }
+    ui_offset(0.0f, 0.0f);
+    fade_in_veil(UI_BOTTOM_WIDTH, 0.0f, p);
+    if (app->modal != MODAL_NONE) draw_modal_bottom(app, op);
+    if (app->busy) {
+        ui_rect(0, 0, UI_BOTTOM_WIDTH, UI_HEIGHT, ui_with_alpha(UI_BG, 0xE8));
+        const UiRect card = { 70, 64, 180, 112 };
+        ui_rect_r(card, UI_SURFACE);
+        ui_outline(card.x, card.y, card.w, card.h, 1.0f, UI_LINE_STRONG);
+        ui_rect(card.x, card.y, card.w, 2, UI_ACCENT);
+        ui_enso(160, 104, 18, UI_ACCENT);
+        static const char *const hints[] = { "B", "Cancel", NULL };
+        ui_hint_row(160, 142, hints);
+    }
+}
+
+/* ---- Touch ---------------------------------------------------------------- */
+
+uint16_t screens_stream_held_buttons(const App *app, int x, int y)
+{
+    if (app->view != VIEW_STREAM || app->keyboard_open || app->stream_menu || app->controls_open)
+        return 0;
+    if (ui_hit(STR_L3, x, y)) return HOST_PAD_LEFT_THUMB;
+    if (ui_hit(STR_R3, x, y)) return HOST_PAD_RIGHT_THUMB;
+    if (ui_hit(STR_GUIDE, x, y)) return HOST_PAD_GUIDE;
+    return 0;
+}
+
+AppAction screens_touch(const App *app, int x, int y)
+{
+    if (app->busy) return ACTION_NONE;
+    g_touched_option_row = -1;
+    if (app->whats_new_open && app->view != VIEW_STREAM)
+        return ui_hit(NEW_CONTINUE, x, y) ? ACTION_WHATS_NEW_CLOSE : ACTION_NONE;
+    if (app->update_open && app->view != VIEW_STREAM && app->guide_page < 0) {
+        if (ui_hit(UPD_PRIMARY, x, y)) return ACTION_UPDATE_PRIMARY;
+        if (updater_info().state == UPDATE_AVAILABLE) {
+            if (ui_hit(UPD_LATER, x, y)) return ACTION_UPDATE_LATER;
+            if (ui_hit(UPD_CLOSE, x, y)) return ACTION_UPDATE_CLOSE;
+        } else if (ui_hit((UiRect){ 90, 200, 140, 34 }, x, y)) {
+            return ACTION_UPDATE_CLOSE;
+        }
+        return ACTION_NONE;
+    }
+    if (app->guide_page >= 0 && app->view != VIEW_STREAM) {
+        if (ui_hit(GUIDE_BACK, x, y)) return ACTION_GUIDE_BACK;
+        if (ui_hit(GUIDE_SKIP, x, y)) return ACTION_GUIDE_SKIP;
+        if (ui_hit(GUIDE_NEXT, x, y)) return ACTION_GUIDE_NEXT;
+        return ACTION_NONE;
+    }
+    if (app->modal != MODAL_NONE) {
+        if (ui_hit(MODAL_LEFT, x, y)) return app->modal == MODAL_ERROR ? ACTION_RETRY : ACTION_CONFIRM;
+        if (app->modal != MODAL_REPORT_SENT && ui_hit(MODAL_RIGHT, x, y)) return ACTION_DISMISS;
+        return ACTION_NONE;
+    }
+    switch (app->view) {
+    case VIEW_WELCOME:
+        if (ui_hit(WEL_SIGN_IN, x, y)) return ACTION_SIGN_IN;
+        if (ui_hit(WEL_SETTINGS, x, y)) return ACTION_SETTINGS;
+        if (ui_hit(WEL_EXIT, x, y)) return ACTION_EXIT;
+        break;
+    case VIEW_LOGIN:
+        if (ui_hit(PAIR_LEFT, x, y)) return ACTION_NEW_CODE;
+        if (ui_hit(PAIR_RIGHT, x, y)) return ACTION_CANCEL;
+        break;
+    case VIEW_LIBRARY:
+    {
+        const LibraryLayout *l = library_layout(app);
+        if (l == &LIB_COMPACT && ui_hit(l->cont, x, y)) return ACTION_CONTINUE;
+        if (ui_hit(l->prev, x, y)) return ACTION_PREV;
+        if (ui_hit(l->next, x, y)) return ACTION_NEXT;
+        if (ui_hit(l->play, x, y))
+            return app->list_count ? ACTION_PLAY : ACTION_LIBRARY;
+        if (ui_hit(l->library, x, y)) return ACTION_LIBRARY;
+        if (ui_hit(l->search, x, y)) return ACTION_SEARCH;
+        if (ui_hit(l->settings, x, y)) return ACTION_SETTINGS;
+    }
+        break;
+    case VIEW_SETTINGS:
+        if (ui_hit(SET_PREV, x, y)) return ACTION_VALUE_PREV;
+        if (ui_hit(SET_NEXT, x, y)) return ACTION_VALUE_NEXT;
+        if (ui_hit(SET_BACK, x, y)) return ACTION_BACK;
+        break;
+    case VIEW_SESSION:
+        if (session_failed(app) && !app->waiting_wifi && (app->reconnect_attempt == 0 || app->reconnect_attempt > 3)) {
+            if (ui_hit(PAIR_LEFT, x, y)) return ACTION_RETRY;
+            if (ui_hit(PAIR_RIGHT, x, y)) return ACTION_CANCEL;
+        } else if (ui_hit(SINGLE, x, y)) {
+            return ACTION_CANCEL;
+        }
+        break;
+    case VIEW_DETAILS:
+        if (app->mapping_open) {
+            if (ui_hit(MAP_PREV, x, y)) return ACTION_MAP_PREV;
+            if (ui_hit(MAP_NEXT, x, y)) return ACTION_MAP_NEXT;
+            if (ui_hit(MAP_RESET, x, y)) return ACTION_MAP_RESET;
+            if (ui_hit(MAP_CANCEL, x, y)) return ACTION_MAP_CANCEL;
+            if (ui_hit(MAP_DONE, x, y)) return ACTION_MAP_DONE;
+            return ACTION_NONE;
+        }
+        if (app->options_open) {
+            if (ui_hit(OPT_CLOSE, x, y)) return ACTION_OPTIONS_CLOSE;
+            for (int i = 0; i < OPTION_COUNT; ++i) {
+                const UiRect row = { 12, OPT_ROW_Y + i * OPT_ROW_H, 296, OPT_ROW_H - 4 };
+                if (!ui_hit(row, x, y)) continue;
+                g_touched_option_row = i;
+                return x < 160 ? ACTION_OPTION_PREV : ACTION_OPTION_NEXT;
+            }
+            break;
+        }
+        if (ui_hit(DET_PLAY, x, y)) return ACTION_DETAILS_PLAY;
+        if (ui_hit(DET_STORE_PREV, x, y)) return ACTION_VARIANT_PREV;
+        if (ui_hit(DET_STORE_NEXT, x, y)) return ACTION_VARIANT_NEXT;
+        if (ui_hit(DET_FAV, x, y)) return ACTION_FAVOURITE;
+        if (ui_hit(DET_OPTIONS, x, y)) return ACTION_OPTIONS;
+        if (ui_hit(DET_BACK, x, y)) return ACTION_BACK;
+        break;
+    case VIEW_STREAM:
+        if (app->controls_open) return ACTION_CONTROLS_CLOSE;
+        if (app->stream_menu) {
+            for (int i = 0; i < STREAM_MENU_COUNT; ++i)
+                if (ui_hit(menu_item(i), x, y)) return (AppAction)(ACTION_MENU_RESUME + i);
+            if (!ui_hit(MENU_PANEL, x, y)) return ACTION_MENU_RESUME;
+            break;
+        }
+        if (ui_hit(stream_button(0), x, y)) return ACTION_STREAM_KEYBOARD;
+        if (ui_hit(stream_button(1), x, y)) return ACTION_STREAM_POINTER;
+        if (ui_hit(stream_button(2), x, y)) return ACTION_STREAM_ZOOM;
+        if (ui_hit(stream_button(3), x, y)) return ACTION_STREAM_MENU;
+        break;
+    }
+    return ACTION_NONE;
+}

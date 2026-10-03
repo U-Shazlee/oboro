@@ -1,0 +1,49 @@
+/*
+ * This file is part of Moonlight Embedded.
+ *
+ * Copyright (C) 2015 Iwan Timmer
+ *
+ * Moonlight is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Moonlight is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Moonlight; if not, see <http://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include <stdint.h>
+#include <stdlib.h>
+
+#define CERTIFICATE_FILE_NAME "client.pem"
+#define KEY_FILE_NAME "key.pem"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct _HTTP_DATA {
+    char *memory;
+    size_t size;
+} HTTP_DATA, *PHTTP_DATA;
+
+int gs_http_init(const char *keyDirectory, int logLevel);
+PHTTP_DATA gs_http_create_data();
+int gs_http_request(char *url, PHTTP_DATA data);
+void gs_http_cleanup();
+void gs_http_free_data(PHTTP_DATA data);
+void gs_http_set_timeout_s(uint32_t connection_timeout_in);
+void gs_http_set_log_level(int log_level_in);
+/* Abort the request in flight (from any thread). */
+void gs_http_cancel(void);
+
+#ifdef __cplusplus
+}
+#endif

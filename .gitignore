@@ -1,0 +1,23 @@
+# Build output
+build/
+*.elf
+*.3dsx
+*.smdh
+*.map
+*.cia
+*.log
+
+# Fetched by tools/fetch-deps.sh
+third_party/moonlight-common-c/
+third_party/openssl/
+third_party/libexpat/
+
+# Private: this console's pairing key and the PC it is paired with.
+keys/
+host.json
+
+# Diagnostics and crash dumps from test sessions
+*-diagnostic*.txt
+*.dmp
+
+__pycache__/
