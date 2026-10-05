@@ -24,15 +24,18 @@ static int number(json_t *root, const char *key)
     return json_is_number(value) ? (int)(json_number_value(value) + 0.5) : -1;
 }
 
-void pc_stats_poll(const char *address)
+void pc_stats_poll(const char *address, const char *key)
 {
     const u64 now = osGetTime();
     if (!address || !address[0] || now < g_next_poll_at) return;
     char url[128];
     snprintf(url, sizeof(url), "http://%.64s:%d/stats", address, OBORO_HOST_PORT);
+    char key_header[40];
+    snprintf(key_header, sizeof(key_header), "X-Oboro-Key: %.20s", key && key[0] ? key : "none");
+    const char *const headers[] = { key_header };
     HttpResponse response;
     http_next_request(2, NULL, NULL);
-    const bool ok = http_request("GET", url, APP_NAME "-3DS", NULL, 0, NULL, 4096, &response) &&
+    const bool ok = http_request("GET", url, APP_NAME "-3DS", headers, 1, NULL, 4096, &response) &&
                     response.status == 200 && response.body;
     json_error_t error;
     json_t *root = ok ? json_loadb(response.body, response.size, 0, &error) : NULL;

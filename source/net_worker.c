@@ -42,7 +42,17 @@ static void publish(void)
 static bool run_job(NetJobKind kind, const char *text, const HostGame *game)
 {
     switch (kind) {
-    case NET_JOB_BEGIN_LOGIN: return host_begin_login(&g_work, text); /* text: the PC's address */
+    case NET_JOB_BEGIN_LOGIN: {
+        char address[sizeof(g_pending_text)];
+        snprintf(address, sizeof(address), "%s", text);
+        char *key = strchr(address, ' ');
+        if (key) *key++ = '\0';
+        return host_begin_login(&g_work, address, key ? key : "");
+    }
+    case NET_JOB_SET_HOST_KEY:
+        if (!host_set_key(&g_work, text)) return false;
+        game_art_prefetch(g_work.games, (unsigned)g_work.game_count);
+        return true;
     case NET_JOB_CANCEL_LOGIN:
         g_work.auth_state = HOST_AUTH_LOGGED_OUT;
         g_work.pair_pending = false;
@@ -125,7 +135,7 @@ static void worker_main(void *arg)
             last_publish = osGetTime();
         }
         /* While a game streams, the PC's own numbers for the stats tiles. */
-        if (host_session_active(&g_work)) pc_stats_poll(g_work.address);
+        if (host_session_active(&g_work)) pc_stats_poll(g_work.address, g_work.host_key);
         /* Box art only downloads while no game is launching or running, so
          * it never competes with the stream for Wi-Fi. */
         if (!host_session_active(&g_work) && game_art_work()) continue;

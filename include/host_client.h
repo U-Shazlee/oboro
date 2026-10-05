@@ -5,7 +5,8 @@
 #include <stdint.h>
 
 /* The gaming PC this console streams from: a Sunshine (or GameStream) host
- * on the local network. Pairing and starting the stream go through
+ * on the local network, or behind a relay with a public address
+ * (docs/remote-play.md). Pairing and starting the stream go through
  * libgamestream; the stream itself is moon_transport.
  *
  * The library comes from Oboro Host (host/oboro_host.py on the PC): the
@@ -59,6 +60,11 @@ typedef struct {
     char status[160];
     /* The PC's address as typed ("192.168.1.20"). */
     char address[64];
+    /* Oboro Host's key (12 digits, shown on the PC); sent with every request
+     * to it. Empty until typed. */
+    char host_key[16];
+    /* Oboro Host answered but refused the key: the UI asks for it. */
+    bool key_refused;
     /* The PC's graphics card, as it reports it. */
     char gpu[64];
     /* Pairing: the PIN to type on the PC and where to type it. */
@@ -83,8 +89,11 @@ typedef struct {
 struct MoonTransport;
 
 void host_client_init(HostClient *client);
-/* Reach the PC at `address`; paired already, or a PIN to pair with. */
-bool host_begin_login(HostClient *client, const char *address);
+/* Reach the PC at `address`; paired already, or a PIN to pair with. `key`:
+ * Oboro Host's key ("" when not typed). */
+bool host_begin_login(HostClient *client, const char *address, const char *key);
+/* A new key for Oboro Host on the paired PC, then the library again. */
+bool host_set_key(HostClient *client, const char *key);
 /* Worker, when idle: sends the pairing request once the PIN is shown. */
 void host_tick(HostClient *client);
 bool host_fetch_library(HostClient *client);

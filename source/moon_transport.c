@@ -348,6 +348,14 @@ unsigned moon_recovered_packets(const MoonTransport *t)
     return stats ? stats->packetCountFecRecovered : 0;
 }
 
+void moon_packet_totals(const MoonTransport *t, unsigned *received, unsigned *recovered, unsigned *failed)
+{
+    const RTP_VIDEO_STATS *stats = t && t->state == MOON_CONNECTED ? LiGetRTPVideoStats() : NULL;
+    *received = stats ? stats->packetCountVideo : 0;
+    *recovered = stats ? stats->packetCountFecRecovered : 0;
+    *failed = stats ? stats->packetCountFecFailed : 0;
+}
+
 /* ---- Input ----------------------------------------------------------------- */
 
 void moon_tick(MoonTransport *t)
@@ -361,7 +369,10 @@ void moon_tick(MoonTransport *t)
     }
     if (t->state != MOON_CONNECTED || !t->input_ready) return;
     uint32_t rtt = 0, variance = 0;
-    if (LiGetEstimatedRttInfo(&rtt, &variance)) t->rtt_ms = (int)rtt;
+    if (LiGetEstimatedRttInfo(&rtt, &variance)) {
+        t->rtt_ms = (int)rtt;
+        t->rtt_variance_ms = (int)variance;
+    }
 
     HostGamepadState state;
     host_input_read_3ds(&state);
@@ -396,6 +407,8 @@ void moon_tick(MoonTransport *t)
     if (LiSendMultiControllerEvent(0, 1, state.buttons, state.left_trigger, state.right_trigger,
                                    state.left_x, state.left_y, state.right_x, state.right_y) == 0)
         t->input_reports++;
+    else
+        t->input_failed++;
     t->input_state_sent = true;
     t->last_input_buttons = state.buttons;
     t->last_input_left_trigger = state.left_trigger;

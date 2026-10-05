@@ -18,7 +18,8 @@ typedef struct {
     int fps;
 } PcStats;
 
-/* Network worker, while a stream runs: asks the PC at most every 2 s. */
-void pc_stats_poll(const char *address);
+/* Network worker, while a stream runs: asks the PC at most every 2 s.
+ * `key`: Oboro Host's key. */
+void pc_stats_poll(const char *address, const char *key);
 /* UI thread: the newest answer. */
 PcStats pc_stats_get(void);

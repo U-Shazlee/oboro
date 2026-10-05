@@ -104,9 +104,10 @@ int gs_http_request(char *url, PHTTP_DATA data) {
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, connection_timeout_s);
     curl_easy_setopt(curl, CURLOPT_VERBOSE, log_level > 0 ? 1L : 0);
-#ifdef __FreeBSD__
-    curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1);
-#endif
+    /* Close the connection with each answer. Left open after a launch, it
+     * kept Sunshine's HTTPS port from answering anyone (this console's next
+     * request included) until the console finally closed it. */
+    curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
 
     if (log_level) {
         printf("Request %s\n", url);

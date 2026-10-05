@@ -61,6 +61,8 @@ typedef struct MoonTransport {
     unsigned audio_errors;
 
     unsigned input_reports;
+    /* Reports the control stream refused to take. */
+    unsigned input_failed;
     unsigned mouse_moves;
     unsigned mouse_clicks;
     unsigned keyboard_keys;
@@ -77,6 +79,8 @@ typedef struct MoonTransport {
     int16_t last_input_left_x, last_input_left_y;
     int16_t last_input_right_x, last_input_right_y;
     int rtt_ms;
+    /* How much the round trip swings, as the control stream estimates it. */
+    int rtt_variance_ms;
 } MoonTransport;
 
 /* The decoder is fed from the stream's own threads: hold this around
@@ -101,6 +105,9 @@ void moon_close(MoonTransport *transport);
 bool moon_gameplay_ready(const MoonTransport *transport);
 /* Video packets rebuilt from error correction since the stream started. */
 unsigned moon_recovered_packets(const MoonTransport *transport);
+/* Video packets since the stream started: received, rebuilt from error
+ * correction, and lost beyond rebuilding. Zeros when not connected. */
+void moon_packet_totals(const MoonTransport *transport, unsigned *received, unsigned *recovered, unsigned *failed);
 void moon_set_pointer_mode(MoonTransport *transport, bool enabled);
 bool moon_mouse_move(MoonTransport *transport, int16_t dx, int16_t dy);
 bool moon_mouse_button(MoonTransport *transport, bool pressed);

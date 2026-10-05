@@ -12,8 +12,10 @@
 
 typedef enum {
     NET_JOB_NONE,
-    /* Text: the PC's address. */
+    /* Text: the PC's address, a space, Oboro Host's key (may be empty). */
     NET_JOB_BEGIN_LOGIN,
+    /* Text: Oboro Host's key, for the PC already paired. */
+    NET_JOB_SET_HOST_KEY,
     NET_JOB_CANCEL_LOGIN,
     NET_JOB_LOAD_LIBRARY,
     NET_JOB_START_SESSION,

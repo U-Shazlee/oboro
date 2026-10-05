@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Publishing the latest build (last step) writes to the releases.
+    permissions:
+      contents: write
     container: devkitpro/devkitarm:latest
     steps:
       - uses: actions/checkout@v4
@@ -58,3 +61,16 @@ jobs:
           path: |
             Oboro.3dsx
             Oboro.cia
+
+      # Every push to main replaces the files of one fixed release, so the
+      # install QR code in the README always fetches the newest build.
+      - name: Publish the latest build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-build
+          name: Latest build
+          body: Built from the newest commit on main. Scan the QR code in the README with FBI to install it.
+          files: |
+            Oboro.cia
+            Oboro.3dsx

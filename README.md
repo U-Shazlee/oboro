@@ -33,12 +33,13 @@ play.
 - **Remote keyboard and touchpad** for launchers and sign-in screens.
 - **Reconnects by itself** after a dropped connection or closing the lid.
   Leaving a stream leaves the game running on the PC, so you can resume it.
-- **Live stats on the lower screen**, four pages (tap the tiles to turn the
+- **Live stats on the lower screen**, five pages (tap the panel to turn the
   page):
 
   | Page | Tiles |
   |---|---|
   | Stream | FPS shown, bitrate (Mbps), ping (ms), packets rebuilt by error correction per second |
+  | Network | a verdict naming the likely cause of lag, the last minute as a strip, and a rated bar each for ping, packet loss, frames arriving from the PC, data rate and the console's input upload |
   | PC | CPU %, GPU %, RAM %, GPU temperature |
   | PC, more | the game's own FPS, VRAM %, encode time (ms), frames the PC sent per second |
   | Console | battery %, Wi-Fi bars, Wi-Fi throughput (Mbps), video decode time (ms) |
@@ -50,8 +51,21 @@ play.
   decoder.
 - A PC running [Sunshine](https://github.com/LizardByte/Sunshine) and
   Oboro Host (`host/oboro_host.py`, needs [Python 3](https://www.python.org/)),
-  on the same network as the console.
+  on the same network as the console. To play away from home, see
+  [Playing away from home](docs/remote-play.md).
 - 2.4 GHz Wi-Fi with a good signal (3 bars is best).
+
+## Install
+
+In FBI on the 3DS, choose **Remote Install > Scan QR Code** and scan this. It
+always fetches the newest build of `main`:
+
+![QR code for Oboro.cia](docs/install-qr.png)
+
+Or download `Oboro.cia` (FBI) or `Oboro.3dsx` (Homebrew Launcher) from the
+[latest build](https://github.com/U-Shazlee/oboro/releases/tag/latest-build).
+If the HOME Menu still shows an old icon after an update, delete the title in
+FBI and install it again; settings and pairing stay on the SD card.
 
 ## Getting started
 
@@ -59,7 +73,9 @@ play.
    (`ipconfig` on Windows).
 2. On the PC, run `python host/oboro_host.py --install` once (it then starts
    with Windows), and `python host/oboro_host.py` to start it now.
-3. Open Oboro, press **A**, and type the PC's IP address.
+3. Open Oboro, press **A**, and type the PC's IP address, then Oboro Host's
+   12-digit key (`python host/oboro_host.py --key`, or the top of
+   `http://localhost:48100` on the PC).
 4. Oboro shows a 4-digit PIN. On the PC, open Sunshine's web page
    (`https://localhost:47990`), go to **PIN**, and enter it.
 5. Your games load. Press **A** on one to open its page, **A** again to play.
@@ -75,7 +91,7 @@ protocol carries nothing about the PC's CPU or GPU. Both can only be read on
 the PC itself, so one small program runs there next to Sunshine:
 
 ```
-python host/oboro_host.py --install     (once: start it with Windows)
+python host/oboro_host.py --install     (once: start it with Windows, add it to the Start menu)
 python host/oboro_host.py               (start it now)
 ```
 
@@ -97,9 +113,10 @@ network. It does three things:
 
 `python host/oboro_host.py --once` prints the library and one stats sample.
 
-Who can do what: other devices on your network can read the library and the
-stats, and can start a game that is already in the library. Adding or
-removing games only works from a browser on the PC itself.
+Who can do what: a device that sends Oboro Host's key can read the library
+and the stats, and can start a game that is already in the library. Without
+the key it gets nothing. Adding or removing games only works from a browser
+on the PC itself.
 
 Without Oboro Host the 3DS falls back to Sunshine's own app list, and the PC
 tiles stay empty.
@@ -155,8 +172,9 @@ tools/build-deps.sh     # builds OpenSSL and libexpat into portlibs, once
 make
 ```
 
-`.github/workflows/build.yml` does the same on GitHub Actions and uploads
-`Oboro.3dsx` and `Oboro.cia` as artifacts.
+`.github/workflows/build.yml` does the same on GitHub Actions, uploads
+`Oboro.3dsx` and `Oboro.cia` as artifacts, and on `main` publishes them as
+the "Latest build" release.
 
 Copy `Oboro.3dsx` to `sdmc:/3ds/` for the Homebrew Launcher, or install
 `Oboro.cia` with FBI.
@@ -169,7 +187,8 @@ Copy `Oboro.3dsx` to `sdmc:/3ds/` for the Homebrew Launcher, or install
   symbols. `host/test_oboro_host.py` passes on Windows: Steam games and
   covers are found, custom games are added and removed, and launch requests
   are accepted or refused as intended. CPU and RAM readings work.
-- **Not verified:** a devkitARM build and link, the Docker image, the CI
+- **Not verified:** the relay scripts in `relay/` on a real server, a
+  devkitARM build and link, the Docker image, the CI
   workflow, and anything at run time on a console: pairing, launching,
   video, audio, input, the stats layout. `libgamestream/client.c` (OpenSSL)
   is not covered by the typecheck. The GPU and game-FPS readings of
@@ -179,8 +198,9 @@ Copy `Oboro.3dsx` to `sdmc:/3ds/` for the Homebrew Launcher, or install
 
 - Set `APP_REPOSITORY` in `include/app_paths.h` to your GitHub repository to
   switch the built-in updater on (it is off while it says `CHANGE-ME`).
-- Replace the art in `gfx/` and `resources/` (icon, banner, hero): it is
-  Kasumi's, kept as a placeholder.
+- The HOME Menu icon, the banner and the seal are Oboro's own. The rest of
+  the art in `gfx/` (hero, mist, ensō, lantern) and the banner sound are
+  still Kasumi's.
 
 ## How it works
 

@@ -34,6 +34,7 @@
 static SERVER_DATA g_server;
 static STREAM_CONFIGURATION g_config;
 static char g_address[64];
+static char g_host_key[16];
 static bool g_connected;
 /* When the PC last failed to answer: box art must not retry every cover. */
 static u64 g_connect_failed_at;
@@ -56,7 +57,7 @@ static void save_host(const HostClient *c)
 {
     mkdir("sdmc:/3ds", 0777);
     mkdir(APP_DATA_DIR, 0777);
-    json_t *root = json_pack("{s:s,s:s}", "address", c->address, "gpu", c->gpu);
+    json_t *root = json_pack("{s:s,s:s,s:s}", "address", c->address, "gpu", c->gpu, "key", c->host_key);
     if (!root) return;
     json_dump_file(root, HOST_PATH, JSON_INDENT(2));
     json_decref(root);
@@ -86,7 +87,7 @@ static bool connect_host(HostClient *c)
 {
     snprintf(g_address, sizeof(g_address), "%s", c->address);
     if (!connect_address()) {
-        set_status(c, "Can't reach %.40s (%.60s). Is Sunshine running, on the same Wi-Fi?", c->address, gs_reason());
+        set_status(c, "Can't reach %.40s (%.60s). Is Sunshine running, and this address right?", c->address, gs_reason());
         return false;
     }
     if (g_server.gpuType) snprintf(c->gpu, sizeof(c->gpu), "%s", g_server.gpuType);
@@ -116,13 +117,28 @@ void host_client_init(HostClient *client)
         snprintf(client->address, sizeof(client->address), "%s", json_string_value(address));
         snprintf(g_address, sizeof(g_address), "%s", client->address);
         if (json_is_string(gpu)) snprintf(client->gpu, sizeof(client->gpu), "%s", json_string_value(gpu));
+        json_t *key = json_object_get(root, "key");
+        if (json_is_string(key)) snprintf(client->host_key, sizeof(client->host_key), "%s", json_string_value(key));
+        snprintf(g_host_key, sizeof(g_host_key), "%s", client->host_key);
         client->auth_state = HOST_AUTH_LOGGED_IN;
     }
     json_decref(root);
 }
 
-bool host_begin_login(HostClient *c, const char *address)
+/* The key is typed on the number pad and goes into a header: digits only. */
+static void take_key(HostClient *c, const char *key)
 {
+    size_t n = 0;
+    for (const char *p = key; p && *p && n + 1 < sizeof(c->host_key); ++p)
+        if (*p >= '0' && *p <= '9') c->host_key[n++] = *p;
+    c->host_key[n] = '\0';
+    snprintf(g_host_key, sizeof(g_host_key), "%s", c->host_key);
+    c->key_refused = false;
+}
+
+bool host_begin_login(HostClient *c, const char *address, const char *key)
+{
+    take_key(c, key);
     /* The address comes from the on-screen keyboard: keep what a host name
      * or IP address can hold and nothing else (it goes into URLs). */
     size_t n = 0;
@@ -155,6 +171,13 @@ bool host_begin_login(HostClient *c, const char *address)
     c->auth_state = HOST_AUTH_WAITING;
     set_status(c, "Type the PIN on your PC");
     return true;
+}
+
+bool host_set_key(HostClient *c, const char *key)
+{
+    take_key(c, key);
+    save_host(c);
+    return host_fetch_library(c);
 }
 
 void host_tick(HostClient *c)
@@ -205,14 +228,17 @@ static bool from_oboro_host(const char *id)
 }
 
 /* One request to Oboro Host on the PC; true on HTTP 200 (free the response
- * either way). The header keeps web pages from starting games. */
+ * either way). The first header keeps web pages from starting games; the
+ * key is what Oboro Host lets in (401 without it). */
 static bool oboro_host_request(const char *method, const char *path, size_t limit, HttpResponse *response)
 {
-    static const char *const headers[] = { "X-Oboro: 1" };
+    char key[40];
+    snprintf(key, sizeof(key), "X-Oboro-Key: %s", g_host_key[0] ? g_host_key : "none");
+    const char *const headers[] = { "X-Oboro: 1", key };
     char url[192];
     snprintf(url, sizeof(url), "http://%.64s:%d%s", g_address, OBORO_HOST_PORT, path);
     http_next_request(5, NULL, NULL);
-    return http_request(method, url, APP_NAME "-3DS", headers, 1, NULL, limit, response) &&
+    return http_request(method, url, APP_NAME "-3DS", headers, 2, NULL, limit, response) &&
            response->status == 200;
 }
 
@@ -233,6 +259,7 @@ static bool fetch_oboro_library(HostClient *c)
 {
     HttpResponse response;
     const bool ok = oboro_host_request("GET", "/library", 256 * 1024, &response);
+    c->key_refused = response.status == 401;
     json_error_t error;
     json_t *root = ok && response.body ? json_loadb(response.body, response.size, 0, &error) : NULL;
     http_response_free(&response);
@@ -301,7 +328,9 @@ bool host_fetch_library(HostClient *c)
     }
     c->library_saved_at = (int64_t)time(NULL);
     save_library(c);
-    set_status(c, "Oboro Host isn't running on your PC: showing Sunshine's %u apps", (unsigned)c->game_count);
+    set_status(c, c->key_refused ? "Oboro Host needs its key: showing Sunshine's %u apps"
+                                 : "Oboro Host isn't running on your PC: showing Sunshine's %u apps",
+               (unsigned)c->game_count);
     return true;
 }
 
@@ -388,8 +417,10 @@ bool host_start_session(HostClient *c, const HostGame *game, bool launch)
         if (!started) {
             c->session_state = HOST_SESSION_IDLE;
             snprintf(c->fail_code, sizeof(c->fail_code), "host");
+            c->key_refused = status == 401;
             set_status(c, status == 404 ? "%.60s is no longer in the library on your PC. Press Y in the library to refresh."
-                                        : "Oboro Host on your PC didn't answer, so %.60s wasn't started.", game->title);
+                          : status == 401 ? "Oboro Host refused this console's key, so %.60s wasn't started."
+                                          : "Oboro Host on your PC didn't answer, so %.60s wasn't started.", game->title);
             return false;
         }
     }
@@ -437,6 +468,7 @@ void host_sign_out(HostClient *c)
     remove(HOST_PATH);
     remove(LIBRARY_PATH);
     memset(c, 0, sizeof(*c));
+    g_host_key[0] = '\0';
     snprintf(c->status, sizeof(c->status), "PC forgotten");
 }
 

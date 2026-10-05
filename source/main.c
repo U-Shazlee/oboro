@@ -34,6 +34,7 @@
 #include "stream_profile.h"
 #include "ui.h"
 #include "moon_transport.h"
+#include "net_health.h"
 
 #define SOC_BUFFER_SIZE (0x100000)
 #define SOC_BUFFER_ALIGNMENT (0x1000)
@@ -413,6 +414,23 @@ static void refresh_device_status(void)
     const unsigned resent = moon_recovered_packets(&g_transport);
     g_app.resent_per_second = resent >= last_resent ? resent - last_resent : 0;
     last_resent = resent;
+    if (g_app.view == VIEW_STREAM && moon_gameplay_ready(&g_transport)) {
+        NetHealthSample sample = {
+            .wifi_bars = g_app.wifi_bars,
+            .rtt_ms = g_transport.rtt_ms,
+            .rtt_variance_ms = g_transport.rtt_variance_ms,
+            .kbps = g_transport.video_kbps,
+            .target_kbps = stream_profile_initial_bitrate(),
+            .pc_fps = g_transport.video_fps,
+            .shown_fps = g_app.fps,
+            .frames_lost = mvd_video_frames_lost(),
+            /* Mouse and keys count too: all of it is the console's upload. */
+            .input_sent = g_transport.input_reports + g_transport.mouse_moves + g_transport.keyboard_keys,
+            .input_failed = g_transport.input_failed,
+        };
+        moon_packet_totals(&g_transport, &sample.video_packets, &sample.recovered_packets, &sample.failed_packets);
+        net_health_sample(&sample);
+    }
     if (g_app.view == VIEW_STREAM && g_perf.active)
         perf_sample(g_transport.rtt_ms, g_app.wifi_bars, g_transport.video_kbps, g_app.fps,
                     g_app.resent_per_second, mvd_video_frames_lost(), g_transport.keyframe_requests,
@@ -435,7 +453,7 @@ static bool ask_address(char *out, size_t size)
 {
     swkbdInit(&g_search_keyboard, SWKBD_TYPE_NUMPAD, 2, 15);
     swkbdSetNumpadKeys(&g_search_keyboard, L'.', 0);
-    swkbdSetHintText(&g_search_keyboard, "Your PC's IP address, like 192.168.1.20");
+    swkbdSetHintText(&g_search_keyboard, "Your PC's (or relay's) IP address");
     swkbdSetButton(&g_search_keyboard, SWKBD_BUTTON_LEFT, "Cancel", false);
     swkbdSetButton(&g_search_keyboard, SWKBD_BUTTON_RIGHT, "Connect", true);
     swkbdSetValidation(&g_search_keyboard, SWKBD_NOTEMPTY_NOTBLANK, 0, 0);
@@ -443,16 +461,36 @@ static bool ask_address(char *out, size_t size)
     return swkbdInputText(&g_search_keyboard, out, size) == SWKBD_BUTTON_RIGHT;
 }
 
-/* Reach the PC and pair with it. `ask`: type its address first (otherwise
- * the one already known is used, for a fresh PIN). */
+/* Oboro Host's key: 12 digits from its page on the PC. False keeps `out`. */
+static bool ask_host_key(char *out, size_t size)
+{
+    char typed[16];
+    swkbdInit(&g_search_keyboard, SWKBD_TYPE_NUMPAD, 2, 12);
+    swkbdSetHintText(&g_search_keyboard, "Oboro Host key (PC: localhost:48100)");
+    swkbdSetButton(&g_search_keyboard, SWKBD_BUTTON_LEFT, "Skip", false);
+    swkbdSetButton(&g_search_keyboard, SWKBD_BUTTON_RIGHT, "OK", true);
+    swkbdSetValidation(&g_search_keyboard, SWKBD_NOTEMPTY_NOTBLANK, 0, 0);
+    if (out[0]) swkbdSetInitialText(&g_search_keyboard, out);
+    if (swkbdInputText(&g_search_keyboard, typed, sizeof(typed)) != SWKBD_BUTTON_RIGHT) return false;
+    snprintf(out, size, "%s", typed);
+    return true;
+}
+
+/* Reach the PC and pair with it. `ask`: type its address and Oboro Host's
+ * key first (otherwise those already known are used, for a fresh PIN). */
 static void begin_login(bool ask)
 {
-    char address[64];
+    char address[64], key[16], text[80];
     snprintf(address, sizeof(address), "%s", g_client.address);
-    if ((ask || !address[0]) && !ask_address(address, sizeof(address))) return;
+    snprintf(key, sizeof(key), "%s", g_client.host_key);
+    if (ask || !address[0]) {
+        if (!ask_address(address, sizeof(address))) return;
+        ask_host_key(key, sizeof(key));
+    }
+    snprintf(text, sizeof(text), "%.60s %.15s", address, key);
     /* A pairing request still waiting for its PIN is dropped first. */
     net_worker_cancel();
-    submit_job(NET_JOB_BEGIN_LOGIN, "Looking for your PC (the first time takes a moment)...", address, NULL);
+    submit_job(NET_JOB_BEGIN_LOGIN, "Looking for your PC (the first time takes a moment)...", text, NULL);
 }
 
 static void load_library(void)
@@ -494,6 +532,7 @@ static void prepare_game_session(const HostGame *game)
     snprintf(g_app.game_title, sizeof(g_app.game_title), "%s", g_current_game.title);
     snprintf(g_app.game_store, sizeof(g_app.game_store), "%s", g_current_game.store);
     g_app.stream_started_at = 0;
+    net_health_reset();
     g_app.zone_index = -1;
     g_app.sound_muted = false;
     zoom_zones_select(g_current_game.app_id);
@@ -1248,7 +1287,7 @@ static void handle_stream(u32 down, u32 held, AppAction action, bool touch_down,
     default: break;
     }
 
-    /* Tapping the stats tiles turns the page: stream, PC, PC, console. */
+    /* Tapping the stats tiles turns the page: stream, network, PC, PC, console. */
     if (touch_down && !g_transport.pointer_mode && !mvd_video_zoomed() && g_app.settings.show_stats &&
         ui_hit(screens_stream_panel(), touch.px, touch.py))
         g_app.stats_page = (g_app.stats_page + 1) % STATS_PAGES;
@@ -1687,6 +1726,27 @@ static void share_prompt_tick(void)
     open_modal(MODAL_SHARE_ASK, "協力", "HELP IMPROVE OBORO?", "");
 }
 
+/* Oboro Host refused this console's key (never typed, or changed on the PC):
+ * ask for it when the library is quiet. Once per library load, so a wrong
+ * key does not trap the player in the keypad; Y in the library asks again. */
+static bool g_host_key_asked;
+
+static void host_key_prompt_tick(void)
+{
+    if (!g_client.key_refused) {
+        g_host_key_asked = false;
+        return;
+    }
+    if (g_host_key_asked || g_app.view != VIEW_LIBRARY || g_app.settings_open || g_app.whats_new_open ||
+        g_app.guide_page >= 0 || g_app.update_open || g_app.modal != MODAL_NONE ||
+        net_worker_busy() || host_session_active(&g_client))
+        return;
+    g_host_key_asked = true;
+    char key[16];
+    snprintf(key, sizeof(key), "%s", g_client.host_key);
+    if (ask_host_key(key, sizeof(key))) submit_job(NET_JOB_SET_HOST_KEY, "Checking the key...", key, NULL);
+}
+
 /* A launch failed: ask about an app in the way, or show the error. */
 static void launch_failed(void)
 {
@@ -1721,7 +1781,9 @@ static void finish_jobs(void)
         /* The PC stopped answering: back to the library, with the reason. */
         open_modal(MODAL_ERROR, "切断", "CONNECTION LOST", g_client.status);
     }
-    if (result.kind == NET_JOB_LOAD_LIBRARY) g_app.selected = g_app.list_top = 0;
+    if (result.kind == NET_JOB_LOAD_LIBRARY || result.kind == NET_JOB_SET_HOST_KEY)
+        g_app.selected = g_app.list_top = 0;
+    if (result.kind == NET_JOB_LOAD_LIBRARY) g_host_key_asked = false;
     if (result.kind == NET_JOB_SEND_STATS) {
         g_stats_inflight = false;
         g_stats_failed = !result.ok;
@@ -1902,6 +1964,7 @@ int main(int argc, char **argv)
         }
         net_worker_sync(&g_client);
         finish_jobs();
+        host_key_prompt_tick();
         g_app.busy = net_worker_busy() ? g_busy_message : NULL;
         hidScanInput();
         const u32 down = hidKeysDown();

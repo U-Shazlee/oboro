@@ -11,14 +11,18 @@ It gives the 3DS three things Sunshine does not:
     and the game's own frame rate.
 
     python oboro_host.py              run it (http://<this PC>:48100)
-    python oboro_host.py --install    start it with Windows from now on
-    python oboro_host.py --uninstall  stop starting it with Windows
+    python oboro_host.py --install    start it with Windows from now on, and
+                                      add "Oboro Host" to the Start menu
+    python oboro_host.py --uninstall  undo --install
     python oboro_host.py --once       print the library and one stats sample
 
+    python oboro_host.py --key        print the key the 3DS asks for
+
 Add custom games at http://localhost:48100 in a browser ON THIS PC. That
-page only answers this PC itself. Other devices on your network can read the
-library and the stats and can start a game that is already in the library;
-they can never add one. Only the Python standard library is used.
+page only answers this PC itself, and shows the key. A device that sends the
+key can read the library and the stats and can start a game that is already
+in the library; it can never add one. Only the Python standard library is
+used.
 """
 
 import argparse
@@ -32,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import time
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -40,10 +45,32 @@ PORT = 48100
 WINDOWS = sys.platform == "win32"
 DATA_DIR = Path(os.environ.get("APPDATA") or Path.home() / ".config") / "Oboro"
 GAMES_FILE = DATA_DIR / "games.json"
+KEY_FILE = DATA_DIR / "key.txt"
 # The 3DS reads at most 1 MiB of cover art.
 ART_LIMIT = 1024 * 1024
 # Installed with Steam but not games.
 STEAM_TOOLS = re.compile(r"^(Steamworks Common Redistributables|Proton |Steam Linux Runtime|Steam Audio)", re.I)
+
+
+# ---- Key --------------------------------------------------------------------
+
+def host_key():
+    """The 12 digits a 3DS must send, made on first use. Digits, because the
+    3DS types them on its number pad."""
+    try:
+        key = KEY_FILE.read_text(encoding="ascii").strip()
+        if re.fullmatch(r"\d{12}", key):
+            return key
+    except (OSError, ValueError):
+        pass
+    key = "%012d" % secrets.randbelow(10 ** 12)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    KEY_FILE.write_text(key, encoding="ascii")
+    return key
+
+
+def spaced(key):
+    return " ".join(key[i:i + 4] for i in range(0, len(key), 4))
 
 
 # ---- Steam library ----------------------------------------------------------
@@ -331,6 +358,9 @@ PAGE = """<!doctype html><meta charset="utf-8"><title>Oboro Host</title>
 input[type=text]{width:100%%;padding:.4em;margin:.2em 0 .8em;box-sizing:border-box}
 td{padding:.2em .8em .2em 0}.err{color:#b00}small{color:#666}</style>
 <h1>Oboro Host</h1>
+<p>Key for the 3DS: <b style="font-size:1.4em;letter-spacing:.05em">%(key)s</b><br>
+<small>Oboro asks for it once, after the PC's address. Anyone who has it can start your games: keep it
+private.</small></p>
 <p>%(count)d games are shown on the 3DS: the desktop, %(steam)d installed Steam games (found automatically)
 and the custom games below.</p>
 <p class="err">%(error)s</p>
@@ -349,6 +379,9 @@ library to refresh.</small></p>"""
 
 
 class Handler(BaseHTTPRequestHandler):
+    # The port may face the internet (remote play): drop idle connections.
+    timeout = 15
+
     def _send(self, status, body, content_type="application/json"):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -361,6 +394,10 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").split(":")[0]
         return self.client_address[0] == "127.0.0.1" and host in ("localhost", "127.0.0.1")
 
+    def _keyed(self):
+        """The request carries this PC's key (the 3DS sends it every time)."""
+        return secrets.compare_digest((self.headers.get("X-Oboro-Key") or "").encode(), host_key().encode())
+
     def _page(self, error=""):
         games = library()
         rows = "".join(
@@ -370,13 +407,16 @@ class Handler(BaseHTTPRequestHandler):
             % (html.escape(g["title"]), html.escape(g["path"]), _form_token, html.escape(g["id"]))
             for g in load_custom()) or "<tr><td><small>None yet.</small></td></tr>"
         page = PAGE % {"count": len(games), "steam": sum(g["source"] == "Steam" for g in games),
-                       "error": html.escape(error), "rows": rows, "token": _form_token}
+                       "error": html.escape(error), "rows": rows, "token": _form_token,
+                       "key": spaced(host_key())}
         self._send(200, page.encode(), "text/html; charset=utf-8")
 
     def do_GET(self):
         url = urlsplit(self.path)
         query = parse_qs(url.query)
-        if url.path == "/stats":
+        if url.path in ("/stats", "/library", "/art") and not self._keyed():
+            self.send_error(401)
+        elif url.path == "/stats":
             # One measurement a second at most, however many consoles ask.
             now = time.monotonic()
             if now - _stats_cache["at"] >= 1.0:
@@ -399,7 +439,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         url = urlsplit(self.path)
-        length = min(int(self.headers.get("Content-Length") or 0), 65536)
+        try:
+            length = min(int(self.headers.get("Content-Length") or 0), 65536)
+        except ValueError:
+            length = 0
         form = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
         field = lambda name: form.get(name, [""])[0]
         if url.path == "/launch":
@@ -407,6 +450,8 @@ class Handler(BaseHTTPRequestHandler):
             # a deliberate request) starts games, never a link in a browser.
             if self.headers.get("X-Oboro") != "1":
                 self.send_error(403)
+            elif not self._keyed():
+                self.send_error(401)
             elif launch(parse_qs(url.query).get("id", [""])[0]):
                 self._send(200, b'{"ok":true}')
             else:
@@ -430,6 +475,21 @@ class Handler(BaseHTTPRequestHandler):
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
+def _start_menu_shortcut():
+    return Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/Oboro Host.lnk"
+
+
+def _make_shortcut(link, target, arguments):
+    """A .lnk through Windows' own shell object (the standard library has no
+    writer for them). Values go in as environment variables, not as script."""
+    script = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:OBORO_LINK); "
+              "$s.TargetPath = $env:OBORO_TARGET; $s.Arguments = $env:OBORO_ARGS; "
+              "$s.Description = 'Oboro Host: games and PC stats for the 3DS'; $s.Save()")
+    env = dict(os.environ, OBORO_LINK=str(link), OBORO_TARGET=str(target), OBORO_ARGS=arguments)
+    subprocess.run(["powershell", "-NoProfile", "-Command", script], env=env, check=True,
+                   creationflags=subprocess.CREATE_NO_WINDOW)
+
+
 def set_autostart(enabled):
     if not WINDOWS:
         sys.exit("--install is for Windows; on Linux add this script to your desktop's autostart.")
@@ -439,12 +499,23 @@ def set_autostart(enabled):
             # pythonw: no console window at sign-in.
             pythonw = Path(sys.executable).with_name("pythonw.exe")
             python = pythonw if pythonw.is_file() else Path(sys.executable)
-            winreg.SetValueEx(key, "OboroHost", 0, winreg.REG_SZ, '"%s" "%s"' % (python, Path(__file__).resolve()))
-            print("Oboro Host will start when you sign in to Windows. Run it once now, or sign out and in.")
+            script = Path(__file__).resolve()
+            winreg.SetValueEx(key, "OboroHost", 0, winreg.REG_SZ, '"%s" "%s"' % (python, script))
+            print("Oboro Host will start when you sign in to Windows.")
+            try:
+                # Clicking it starts Oboro Host if needed and opens its page.
+                _make_shortcut(_start_menu_shortcut(), python, '"%s" --open' % script)
+                print('"Oboro Host" is in the Start menu: click it to start it now.')
+            except (OSError, KeyError, subprocess.SubprocessError):
+                print("Couldn't add the Start menu shortcut. Start it now with: python %s" % script)
         else:
             try:
                 winreg.DeleteValue(key, "OboroHost")
             except FileNotFoundError:
+                pass
+            try:
+                _start_menu_shortcut().unlink()
+            except (OSError, KeyError):
                 pass
             print("Oboro Host no longer starts with Windows.")
 
@@ -453,18 +524,33 @@ def main():
     parser = argparse.ArgumentParser(description="Oboro Host: game library, launcher and PC stats for the 3DS")
     parser.add_argument("--port", type=int, default=PORT, help="TCP port (the 3DS expects %d)" % PORT)
     parser.add_argument("--once", action="store_true", help="print the library and one stats sample, then exit")
-    parser.add_argument("--install", action="store_true", help="start with Windows")
-    parser.add_argument("--uninstall", action="store_true", help="stop starting with Windows")
+    parser.add_argument("--key", action="store_true", help="print the key the 3DS asks for, then exit")
+    parser.add_argument("--open", action="store_true", help="also open the page in the browser (the Start menu does)")
+    parser.add_argument("--install", action="store_true", help="start with Windows, and add a Start menu shortcut")
+    parser.add_argument("--uninstall", action="store_true", help="undo --install")
     args = parser.parse_args()
     if args.install or args.uninstall:
         set_autostart(args.install)
+        return
+    if args.key:
+        print(spaced(host_key()))
         return
     if args.once:
         time.sleep(0.5)  # CPU load is measured between two readings
         print(json.dumps({"library": library(), "stats": sample()}, indent=2))
         return
-    server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+    page = "http://localhost:%d" % args.port
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+    except OSError:
+        # Most likely Oboro Host is running already: show its page instead.
+        if args.open:
+            webbrowser.open(page)
+        sys.exit("Port %d is in use: Oboro Host is probably running already." % args.port)
+    if args.open:
+        webbrowser.open(page)
     print("Oboro Host on port %d. Add custom games at http://localhost:%d  (Ctrl+C to stop)" % (args.port, args.port))
+    print("Key for the 3DS: %s" % spaced(host_key()))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -568,7 +568,7 @@ void ui_section(float x, float y, float w, const char *jp, const char *en)
 
 void ui_seal(float x, float y, float size)
 {
-    /* Hanko: celadon stamp with 霞 (oboro, mist) cut out of it. */
+    /* Hanko: celadon stamp with 朧 (oboro, hazy moon) cut out of it. */
     /* GPU downscaling without mipmaps aliases badly, so small seals use
      * copies pre-shrunk with a high-quality filter. */
     const UiImage art = size <= 20.0f ? UI_IMAGE_SEAL_16 : size <= 48.0f ? UI_IMAGE_SEAL_40 : UI_IMAGE_SEAL;
@@ -578,7 +578,7 @@ void ui_seal(float x, float y, float size)
     ui_outline(x + size * 0.09f, y + size * 0.09f, size * 0.82f, size * 0.82f,
                size > 30 ? 2.0f : 1.0f, UI_BG);
     if (g_has_japanese)
-        ui_text(x + size / 2.0f, y + size * 0.14f, size * 0.72f, UI_BG, UI_ALIGN_CENTER, "霞");
+        ui_text(x + size / 2.0f, y + size * 0.14f, size * 0.72f, UI_BG, UI_ALIGN_CENTER, "朧");
     else
         ui_ring(x + size / 2.0f, y + size / 2.0f, size * 0.26f, size > 30 ? 3.0f : 1.5f,
                 UI_BG, UI_ACCENT);

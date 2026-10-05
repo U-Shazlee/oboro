@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import oboro_host as host
 
 tmp = Path(tempfile.mkdtemp())
-host.DATA_DIR, host.GAMES_FILE = tmp, tmp / "games.json"
+host.DATA_DIR, host.GAMES_FILE, host.KEY_FILE = tmp, tmp / "games.json", tmp / "key.txt"
+KEY = {"X-Oboro-Key": host.host_key()}
 server = host.ThreadingHTTPServer(("127.0.0.1", 0), host.Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 base = "http://127.0.0.1:%d" % server.server_address[1]
@@ -36,10 +37,18 @@ def call(path, data=None, headers=None):
 assert host._vdf_values('"path"\t\t"D:\\\\Steam Library"\n"appid"  "620"', "path") == ["D:\\Steam Library"]
 assert host.STEAM_TOOLS.match("Proton 9.0") and not host.STEAM_TOOLS.match("Portal 2")
 
-status, body = call("/stats")
+# The key is 12 digits, kept across restarts, and nothing is served without it.
+assert len(KEY["X-Oboro-Key"]) == 12 and KEY["X-Oboro-Key"].isdigit() and host.host_key() == KEY["X-Oboro-Key"]
+for path in ("/stats", "/library", "/art?id=desktop"):
+    assert call(path)[0] == 401, path
+    assert call(path, headers={"X-Oboro-Key": "wrong"})[0] == 401, path
+assert call("/launch?id=desktop", {}, {"X-Oboro": "1"})[0] == 401
+assert call("/launch?id=desktop", {}, {"X-Oboro": "1", "X-Oboro-Key": "wrong"})[0] == 401
+
+status, body = call("/stats", headers=KEY)
 assert status == 200 and set(json.loads(body)) == {"cpu", "ram", "gpu", "vram", "gpu_temp", "fps"}
 
-games = json.loads(call("/library")[1])["games"]
+games = json.loads(call("/library", headers=KEY)[1])["games"]
 assert games[0] == {"id": "desktop", "title": "Desktop", "source": "PC"}
 assert all(set(g) == {"id", "title", "source"} for g in games)
 steam = [g for g in games if g["source"] == "Steam"]
@@ -60,25 +69,27 @@ assert status == 200 and b"My &lt;Game&gt; 2!" in page
 assert call("/add", {"title": "My Game 2", "path": str(exe), "token": token})[0] == 200
 ids = [g["id"] for g in host.load_custom()]
 assert ids == ["custom-my-game-2", "custom-my-game-2-2"], ids
-games = json.loads(call("/library")[1])["games"]
+games = json.loads(call("/library", headers=KEY)[1])["games"]
 assert {"id": "custom-my-game-2", "title": "My <Game> 2!", "source": "Custom"} in games
 
 # The management page is refused when addressed by another name (DNS rebinding).
 assert call("/", headers={"Host": "evil.example"})[0] == 404
-assert call("/")[0] == 200
+status, page = call("/")
+assert status == 200 and host.spaced(KEY["X-Oboro-Key"]).encode() in page
 
-assert call("/art?id=custom-my-game-2") == (200, b"\x89PNG fake")
-assert call("/art?id=custom-my-game-2-2")[0] == 404
-assert call("/art?id=../../secret")[0] == 404
+assert call("/art?id=custom-my-game-2", headers=KEY) == (200, b"\x89PNG fake")
+assert call("/art?id=custom-my-game-2-2", headers=KEY)[0] == 404
+assert call("/art?id=../../secret", headers=KEY)[0] == 404
 if steam:
-    status, art = call("/art?id=" + steam[0]["id"])
+    status, art = call("/art?id=" + steam[0]["id"], headers=KEY)
     print("steam cover for", steam[0]["title"], "->", status, len(art), "bytes")
 
-# Launching: only with the header, only what is in the library.
-assert call("/launch?id=desktop", {})[0] == 403
-assert call("/launch?id=desktop", {}, {"X-Oboro": "1"})[0] == 200
-assert call("/launch?id=custom-nope", {}, {"X-Oboro": "1"})[0] == 404
-assert call("/launch?id=steam-999999999", {}, {"X-Oboro": "1"})[0] == 404
+# Launching: only with the header and the key, only what is in the library.
+GO = dict(KEY, **{"X-Oboro": "1"})
+assert call("/launch?id=desktop", {}, KEY)[0] == 403
+assert call("/launch?id=desktop", {}, GO)[0] == 200
+assert call("/launch?id=custom-nope", {}, GO)[0] == 404
+assert call("/launch?id=steam-999999999", {}, GO)[0] == 404
 
 assert call("/remove", {"id": "custom-my-game-2", "token": token})[0] == 200
 assert [g["id"] for g in host.load_custom()] == ["custom-my-game-2-2"]

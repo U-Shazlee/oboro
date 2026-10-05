@@ -16,6 +16,7 @@
 #include "remote_keyboard.h"
 #include "stream_profile.h"
 #include "pc_stats.h"
+#include "net_health.h"
 #include "report.h"
 
 /* ---- Shared geometry (drawing and hit-testing use the same rects) -------- */
@@ -1776,7 +1777,8 @@ static void draw_touchpad(void)
 }
 
 /* Four tiles a page; a tap turns the page (handle_stream in main.c):
- * the stream, the PC, more of the PC, this console. */
+ * the stream, the network's health (a page of its own kind, above), the PC,
+ * more of the PC, this console. */
 typedef struct {
     const char *label;
     char value[16];
@@ -1802,6 +1804,99 @@ static void stat_tile_optional(StatTile *tile, const char *label, int value, boo
     else stat_tile(tile, label, false, "-");
 }
 
+/* ---- Network health page ---------------------------------------------------
+ * One verdict, a minute of history, then one row per measurement: a shape
+ * and colour for its state, a bar against its limits, and the number. The
+ * shape repeats what the colour says, for eyes that cannot tell them apart. */
+
+static u32 level_color(NetLevel level)
+{
+    return level == NET_BAD ? UI_DANGER : level == NET_WARN ? UI_KIN : UI_MATCHA;
+}
+
+/* Good is a dot, a warning a triangle, a fault a square. */
+static void level_mark(float cx, float cy, NetLevel level)
+{
+    const u32 color = level_color(level);
+    if (level == NET_BAD) ui_rect(cx - 3, cy - 3, 6, 6, color);
+    else if (level == NET_WARN) ui_triangle(cx, cy - 4, cx - 4, cy + 3, cx + 4, cy + 3, color);
+    else ui_circle(cx, cy, 3, color);
+}
+
+/* `fill` is 0..1 of the bar; the ticks stand at the warning and fault limits
+ * (negative: no tick). */
+static void health_row(float x, float y, float w, const char *label, NetLevel level, u32 fill_color,
+                       float fill, float tick_warn, float tick_bad, const char *value)
+{
+    const float bar_x = x + 62, bar_w = 56, bar_h = 5, bar_y = y + 5;
+    level_mark(x + 6, y + 7, level);
+    ui_label(x + 14, y + 1, 11, UI_TEXT_DIM, UI_ALIGN_LEFT, label);
+    ui_rect(bar_x, bar_y, bar_w, bar_h, UI_LINE);
+    if (fill > 1.0f) fill = 1.0f;
+    if (fill > 0.0f) ui_rect(bar_x, bar_y, bar_w * fill, bar_h, fill_color);
+    if (tick_warn >= 0.0f) ui_rect(bar_x + bar_w * tick_warn, bar_y - 2, 1, bar_h + 4, UI_TEXT_FAINT);
+    if (tick_bad >= 0.0f) ui_rect(bar_x + bar_w * tick_bad, bar_y - 2, 1, bar_h + 4, UI_TEXT_FAINT);
+    ui_text(x + w - 3, y, 12, level == NET_GOOD ? UI_TEXT : level_color(level), UI_ALIGN_RIGHT, value);
+}
+
+static void draw_network_health(UiRect p)
+{
+    const NetHealth *h = net_health_get();
+    ui_rect_r(p, UI_SURFACE);
+    ui_outline(p.x, p.y, p.w, p.h, 1.0f, UI_LINE);
+    if (!h->valid) {
+        ui_label(160, p.y + 44, 11, UI_TEXT_DIM, UI_ALIGN_CENTER, "MEASURING...");
+        return;
+    }
+    /* Verdict: what is wrong, or that nothing is. */
+    const u32 color = level_color(h->level);
+    ui_rect(p.x + 1, p.y + 1, p.w - 2, 16, ui_mix(UI_SURFACE, color, 0.22f));
+    ui_rect(p.x + 1, p.y + 1, 3, 16, color);
+    level_mark(p.x + 12, p.y + 9, h->level);
+    ui_text(p.x + 21, p.y + 2, 12, UI_TEXT, UI_ALIGN_LEFT, net_health_verdict(h));
+    ui_wifi_icon(p.x + p.w - 19, p.y + 4, h->wifi_bars, h->wifi_bars >= 2 ? UI_TEXT : level_color(NET_WARN),
+                 UI_LINE_STRONG);
+
+    /* The last minute, a column a second, newest on the right. */
+    const float strip_y = p.y + 20;
+    for (unsigned i = 0; i < NET_HISTORY; ++i) {
+        const int at = (int)i - (int)(NET_HISTORY - h->history_count);
+        const NetLevel level = at >= 0 ? (NetLevel)h->history[at] : NET_GOOD;
+        const float col_h = at < 0 ? 1.0f : level == NET_BAD ? 7.0f : level == NET_WARN ? 5.0f : 3.0f;
+        ui_rect(p.x + 2 + i * 3.0f, strip_y + 7.0f - col_h, 2, col_h, at < 0 ? UI_LINE : level_color(level));
+    }
+
+    char value[24];
+    float y = p.y + 30;
+    const float step = 14.0f;
+    /* Delay: the bar is full at 200 ms. */
+    snprintf(value, sizeof(value), "%d ms", h->ping_ms);
+    health_row(p.x, y, p.w, "PING", h->ping_level, level_color(h->ping_level), h->ping_ms / 200.0f, 80 / 200.0f,
+               150 / 200.0f, value);
+    y += step;
+    /* Loss: the bar is full at 10 % of packets. */
+    snprintf(value, sizeof(value), "%u.%u%%", h->loss_permille / 10, h->loss_permille % 10);
+    health_row(p.x, y, p.w, "LOSS", h->loss_level, level_color(h->loss_level), h->loss_permille / 100.0f, 0.1f,
+               0.5f, value);
+    y += step;
+    /* Frames arriving from the PC, of the 30 asked for. */
+    snprintf(value, sizeof(value), "%u fps", h->pc_fps);
+    health_row(p.x, y, p.w, "PC", h->pc_level, level_color(h->pc_level), h->pc_fps / 30.0f, 22 / 30.0f,
+               28 / 30.0f, value);
+    y += step;
+    /* Data arriving, against the bitrate asked of the PC (the tick). A still
+     * picture needs little, so this row never raises an alarm by itself. */
+    snprintf(value, sizeof(value), "%u.%u M", h->kbps / 1000, h->kbps % 1000 / 100);
+    const float scale = h->target_kbps ? h->target_kbps * 1.25f : 1.0f;
+    health_row(p.x, y, p.w, "DATA", NET_GOOD, UI_TEXT_DIM, h->kbps / scale, 0.8f, -1.0f, value);
+    y += step;
+    /* The console's own upload: buttons, sticks, mouse and keys. */
+    if (h->input_failed) snprintf(value, sizeof(value), "%u lost", h->input_failed);
+    else snprintf(value, sizeof(value), "%u /s", h->input_per_second);
+    health_row(p.x, y, p.w, "INPUT", h->input_level, level_color(h->input_level), h->input_per_second / 125.0f,
+               -1.0f, -1.0f, value);
+}
+
 static void draw_stats(const App *app)
 {
     const MoonTransport *t = app->transport;
@@ -1811,6 +1906,13 @@ static void draw_stats(const App *app)
         ui_text_wrap(160, p.y + 26, 14, UI_TEXT, UI_ALIGN_CENTER, p.w - 16, 2, 17, app->game_title);
         ui_label(160, p.y + 78, 11, UI_TEXT_DIM, UI_ALIGN_CENTER,
                  app->settings.button_layout == HOST_LAYOUT_POSITION ? "POSITION LAYOUT" : "LETTER LAYOUT");
+        return;
+    }
+    /* The page dots take the bottom strip of the panel. */
+    const float dots_h = 10.0f;
+    if (app->stats_page == STATS_PAGE_NETWORK) {
+        draw_network_health((UiRect){ p.x, p.y, p.w, p.h - dots_h });
+        ui_dots(160, p.y + p.h - dots_h / 2 + 1, STATS_PAGES, (unsigned)app->stats_page, UI_ACCENT, UI_LINE_STRONG);
         return;
     }
     StatTile tiles[4];
@@ -1856,8 +1958,6 @@ static void draw_stats(const App *app)
         stat_tile(&tiles[3], "FEC/S", app->resent_per_second > 2, "%u", app->resent_per_second);
         break;
     }
-    /* The page dots take the bottom strip of the panel. */
-    const float dots_h = 10.0f;
     const float tw = (p.w - 4) / 2, th = (p.h - dots_h - 4) / 2;
     for (int i = 0; i < 4; ++i) {
         const float x = p.x + (i % 2) * (tw + 4), y = p.y + (i / 2) * (th + 4);
